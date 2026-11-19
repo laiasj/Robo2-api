@@ -187,6 +187,7 @@ async def consultar(dados: ConsultaRequest):
         "dados": conteudo_extraido,
     }
 
+from datetime import datetime
 import json
 import urllib.request
 
@@ -197,32 +198,90 @@ TARGETS = [
     {"id": "tech_theverge", "categoria": "Tecnologia", "url": "https://www.theverge.com/rss/index.xml"},
     {"id": "economia_bbc", "categoria": "Economia e Negocios", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"}
 ]
+
+def garantir_tabela_radar():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS radar_historico (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                registrado_em TEXT NOT NULL,
+                alvo_id TEXT NOT NULL,
+                categoria TEXT NOT NULL,
+                status TEXT NOT NULL,
+                volume_dados INTEGER NOT NULL,
+                detalhe TEXT
+            )
+        """)
+        conn.commit()
+
 @app.get("/radar")
 def verificar_categorias():
+    garantir_tabela_radar()
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     resultados = []
-    for alvo in TARGETS:
-        try:
-            req = urllib.request.Request(
-                alvo["url"],
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; Robo2-Radar/1.0)",
-                    "Accept": "*/*"
-                }
+
+    with get_db() as conn:
+        for alvo in TARGETS:
+            status = "online"
+            volume = 0
+            detalhe = None
+            try:
+                req = urllib.request.Request(
+                    alvo["url"],
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; Robo2-Radar/1.0)",
+                        "Accept": "*/*"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    conteudo = resp.read().decode("utf-8", errors="ignore")
+                    volume = len(conteudo)
+            except Exception as e:
+                status = "erro"
+                detalhe = str(e)
+
+            conn.execute(
+                """
+                INSERT INTO radar_historico
+                    (registrado_em, alvo_id, categoria, status, volume_dados, detalhe)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (agora, alvo["id"], alvo["categoria"], status, volume, detalhe)
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                conteudo = resp.read().decode("utf-8", errors="ignore")
-                resultados.append({
-                    "id": alvo["id"],
-                    "categoria": alvo["categoria"],
-                    "status": "online",
-                    "volume_dados": len(conteudo)
-                })
-        except Exception as e:
-            resultados.append({
+
+            item = {
                 "id": alvo["id"],
                 "categoria": alvo["categoria"],
-                "status": "erro",
-                "detalhe": str(e)
-            })
+                "status": status,
+                "volume_dados": volume
+            }
+            if detalhe:
+                item["detalhe"] = detalhe
+            resultados.append(item)
+
+        conn.commit()
+
     resultados.sort(key=lambda x: x.get("volume_dados", 0), reverse=True)
-    return {"ranking_movimento": resultados}
+    return {
+        "registrado_em": agora,
+        "ranking_movimento": resultados
+    }
+
+@app.get("/radar/historico")
+def consultar_historico_radar(limite: int = 50):
+    garantir_tabela_radar()
+    with get_db() as conn:
+        linhas = conn.execute(
+            """
+            SELECT id, registrado_em, alvo_id, categoria, status, volume_dados, detalhe
+            FROM radar_historico
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limite,)
+        ).fetchall()
+
+    return {
+        "total_registros": len(linhas),
+        "historico": [dict(linha) for linha in linhas]
+    }
