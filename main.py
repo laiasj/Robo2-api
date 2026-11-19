@@ -1,14 +1,34 @@
-from fastapi import FastAPI, Query
-from datetime import datetime
+from fastapi import FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from datetime import datetime, timezone
+import os
+import base64
 import urllib.request
 import xml.etree.ElementTree as ET
 import json
 
 app = FastAPI(
     title="Robo2 Signals API",
-    description="API de sinais e manchetes estruturadas em tempo real para agentes de IA (Tecnologia, Economia e Cripto).",
-    version="1.1.0"
+    description="API de sinais e manchetes estruturadas em tempo real para agentes de IA (Tecnologia, Economia e Cripto) com pagamento por requisição via x402 em USDC (Solana).",
+    version="2.1.0"
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"]
+)
+
+PAY_TO_ADDRESS = os.getenv("PAY_TO_ADDRESS", "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk")
+PRECO_USDC = float(os.getenv("PRECO_USDC", "0.01"))
+USDC_MINT_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+REDE_PAGAMENTO = "solana"
+MOEDA_PAGAMENTO = "USDC"
 
 TARGETS = [
     {
@@ -38,11 +58,78 @@ TARGETS = [
 ]
 
 
+def validar_pagamento_solana_usdc(assinatura_tx: str) -> tuple[bool, str]:
+    assinatura = assinatura_tx.strip()
+    if assinatura.startswith("{"):
+        try:
+            payload = json.loads(assinatura)
+            assinatura = (
+                payload.get("signature")
+                or payload.get("txHash")
+                or payload.get("payload", {}).get("signature")
+                or ""
+            ).strip()
+        except Exception:
+            return False, "Formato de comprovante JSON inválido."
+
+    if len(assinatura) < 40:
+        return False, "Assinatura de transação Solana inválida ou curta demais."
+
+    rpc_body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            assinatura,
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}
+        ]
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            SOLANA_RPC_URL,
+            data=rpc_body,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resultado = json.loads(resp.read().decode("utf-8")).get("result")
+
+        if not resultado:
+            return False, "Transação não encontrada ou ainda não confirmada na Solana."
+
+        meta = resultado.get("meta") or {}
+        if meta.get("err") is not None:
+            return False, "Transação falhou na blockchain Solana."
+
+        pre_balances = {
+            b["accountIndex"]: float(b.get("uiTokenAmount", {}).get("uiAmount") or 0)
+            for b in meta.get("preTokenBalances", [])
+            if b.get("mint") == USDC_MINT_SOLANA and b.get("owner") == PAY_TO_ADDRESS
+        }
+        post_balances = {
+            b["accountIndex"]: float(b.get("uiTokenAmount", {}).get("uiAmount") or 0)
+            for b in meta.get("postTokenBalances", [])
+            if b.get("mint") == USDC_MINT_SOLANA and b.get("owner") == PAY_TO_ADDRESS
+        }
+
+        recebido = sum(
+            post_balances.get(idx, 0.0) - pre_balances.get(idx, 0.0)
+            for idx in post_balances
+        )
+
+        if recebido + 1e-9 >= PRECO_USDC:
+            return True, f"Confirmado {recebido:.6f} USDC na Solana (tx: {assinatura})"
+
+        return False, f"Valor recebido insuficiente ({recebido:.6f} USDC; mínimo {PRECO_USDC} USDC)."
+    except Exception as e:
+        return False, f"Erro ao consultar rede Solana: {str(e)}"
+
+
 def extrair_itens_feed(url: str, limite: int = 5):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/1.1)",
+            "User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.1)",
             "Accept": "*/*"
         }
     )
@@ -90,12 +177,83 @@ def extrair_itens_feed(url: str, limite: int = 5):
     return itens
 
 
+def montar_manifesto_x402(resource_url: str):
+    return {
+        "x402Version": 1,
+        "error": "Payment Required",
+        "accepts": [
+            {
+                "scheme": "exact",
+                "network": REDE_PAGAMENTO,
+                "asset": USDC_MINT_SOLANA,
+                "currency": MOEDA_PAGAMENTO,
+                "payTo": PAY_TO_ADDRESS,
+                "maxAmountRequired": str(int(round(PRECO_USDC * 1_000_000))),
+                "amountUSDC": f"{PRECO_USDC:.2f}",
+                "resource": resource_url,
+                "description": "Sinais estruturados em tempo real de Tecnologia, Economia e cotação BTC-USD para agentes de IA.",
+                "mimeType": "application/json"
+            }
+        ]
+    }
+
+
 @app.get("/")
 def root():
     return {
         "status": "online",
         "servico": "Robo2 Signals API",
-        "rotas": ["/radar", "/radar/itens", "/openapi.json"]
+        "versao": "2.1.0",
+        "protocolo_pagamento": "x402",
+        "moeda": MOEDA_PAGAMENTO,
+        "rede": REDE_PAGAMENTO,
+        "recebedor": PAY_TO_ADDRESS,
+        "preco_por_requisicao_usdc": f"{PRECO_USDC:.2f}",
+        "rotas": {
+            "status_gratuito": "/radar",
+            "dados_pagos_x402": "/radar/itens",
+            "manifesto_x402": "/.well-known/x402",
+            "manifesto_agente_ia": "/.well-known/ai-plugin.json",
+            "especificacao_api": "/openapi.json"
+        }
+    }
+
+
+@app.get("/.well-known/x402", summary="Manifesto de descoberta x402 para agentes e catálogos")
+def well_known_x402(request: Request):
+    base = str(request.base_url).rstrip("/")
+    return {
+        "version": 1,
+        "provider": "Robo2 Signals API",
+        "network": REDE_PAGAMENTO,
+        "currency": MOEDA_PAGAMENTO,
+        "payTo": PAY_TO_ADDRESS,
+        "endpoints": [
+            {
+                "path": "/radar/itens",
+                "method": "GET",
+                "priceUSDC": f"{PRECO_USDC:.2f}",
+                "description": "Manchetes de Tecnologia (The Verge, TechCrunch), Economia (CNBC) e cotação BTC-USD em tempo real."
+            }
+        ],
+        "openapi": f"{base}/openapi.json"
+    }
+
+
+@app.get("/.well-known/ai-plugin.json", summary="Manifesto padrão de descoberta para agentes de IA")
+def well_known_ai_plugin(request: Request):
+    base = str(request.base_url).rstrip("/")
+    return {
+        "schema_version": "v1",
+        "name_for_human": "Robo2 Signals API",
+        "name_for_model": "robo2_signals",
+        "description_for_human": "Manchetes estruturadas em tempo real de Tecnologia e Economia + cotação BTC-USD (pagamento via x402 USDC).",
+        "description_for_model": "Fetches real-time structured news headlines for technology (The Verge, TechCrunch) and economy (CNBC) plus live BTC-USD spot price from Coinbase via GET /radar/itens. Requires x402 USDC payment on Solana.",
+        "auth": {"type": "none"},
+        "api": {
+            "type": "openapi",
+            "url": f"{base}/openapi.json"
+        }
     }
 
 
@@ -106,7 +264,7 @@ def verificar_radar():
         try:
             req = urllib.request.Request(
                 alvo["url"],
-                headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/1.1)"}
+                headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.1)"}
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
                 conteudo = resp.read()
@@ -124,16 +282,38 @@ def verificar_radar():
                 "detalhe": str(e)
             })
     return {
-        "registrado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "registrado_em": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "resultados": resultados
     }
 
 
-@app.get("/radar/itens", summary="Extrai manchetes e cotações estruturadas em tempo real")
+@app.get("/radar/itens", summary="Retorna sinais estruturados mediante pagamento x402 em USDC (Solana)")
 def listar_itens_radar(
+    request: Request,
     categoria: str | None = Query(default=None, description="Filtrar por 'tecnologia' ou 'economia'"),
     limite_por_fonte: int = Query(default=5, ge=1, le=20, description="Quantidade de itens por fonte")
 ):
+    comprovante_pagamento = (
+        request.headers.get("X-PAYMENT")
+        or request.headers.get("PAYMENT-SIGNATURE")
+        or request.headers.get("X-Payment-Proof")
+    )
+
+    if not comprovante_pagamento:
+        manifesto = montar_manifesto_x402(str(request.url))
+        header_b64 = base64.b64encode(json.dumps(manifesto).encode("utf-8")).decode("utf-8")
+        return JSONResponse(
+            status_code=402,
+            content=manifesto,
+            headers={"PAYMENT-REQUIRED": header_b64}
+        )
+
+    pago_ok, detalhe_tx = validar_pagamento_solana_usdc(comprovante_pagamento)
+    if not pago_ok:
+        manifesto = montar_manifesto_x402(str(request.url))
+        manifesto["motivo_recusa"] = detalhe_tx
+        return JSONResponse(status_code=402, content=manifesto)
+
     alvos_filtrados = [
         t for t in TARGETS
         if not categoria or t["categoria"].lower() == categoria.lower()
@@ -167,9 +347,14 @@ def listar_itens_radar(
 
     coleta.sort(key=lambda x: x.get("total_itens", 0), reverse=True)
 
-    return {
-        "registrado_em": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "filtro_categoria": categoria or "todas",
-        "total_itens_retornados": total_geral,
-        "fontes": coleta
-    }
+    return JSONResponse(
+        status_code=200,
+        headers={"X-PAYMENT-RESPONSE": detalhe_tx},
+        content={
+            "registrado_em": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "pagamento_validado": detalhe_tx,
+            "filtro_categoria": categoria or "todas",
+            "total_itens_retornados": total_geral,
+            "fontes": coleta
+        }
+    )
