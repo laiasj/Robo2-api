@@ -11,7 +11,7 @@ import json
 app = FastAPI(
     title="Robo2 Signals API",
     description="API de sinais e manchetes estruturadas em tempo real para agentes de IA (Tecnologia, Economia e Cripto) com pagamento por requisição via x402 em USDC (Solana).",
-    version="2.1.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -129,7 +129,7 @@ def extrair_itens_feed(url: str, limite: int = 5):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.1)",
+            "User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.0)",
             "Accept": "*/*"
         }
     )
@@ -203,7 +203,7 @@ def root():
     return {
         "status": "online",
         "servico": "Robo2 Signals API",
-        "versao": "2.1.0",
+        "versao": "2.0.0",
         "protocolo_pagamento": "x402",
         "moeda": MOEDA_PAGAMENTO,
         "rede": REDE_PAGAMENTO,
@@ -213,7 +213,6 @@ def root():
             "status_gratuito": "/radar",
             "dados_pagos_x402": "/radar/itens",
             "manifesto_x402": "/.well-known/x402",
-            "manifesto_agente_ia": "/.well-known/ai-plugin.json",
             "especificacao_api": "/openapi.json"
         }
     }
@@ -240,23 +239,6 @@ def well_known_x402(request: Request):
     }
 
 
-@app.get("/.well-known/ai-plugin.json", summary="Manifesto padrão de descoberta para agentes de IA")
-def well_known_ai_plugin(request: Request):
-    base = str(request.base_url).rstrip("/")
-    return {
-        "schema_version": "v1",
-        "name_for_human": "Robo2 Signals API",
-        "name_for_model": "robo2_signals",
-        "description_for_human": "Manchetes estruturadas em tempo real de Tecnologia e Economia + cotação BTC-USD (pagamento via x402 USDC).",
-        "description_for_model": "Fetches real-time structured news headlines for technology (The Verge, TechCrunch) and economy (CNBC) plus live BTC-USD spot price from Coinbase via GET /radar/itens. Requires x402 USDC payment on Solana.",
-        "auth": {"type": "none"},
-        "api": {
-            "type": "openapi",
-            "url": f"{base}/openapi.json"
-        }
-    }
-
-
 @app.get("/radar")
 def verificar_radar():
     resultados = []
@@ -264,7 +246,7 @@ def verificar_radar():
         try:
             req = urllib.request.Request(
                 alvo["url"],
-                headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.1)"}
+                headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.0)"}
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
                 conteudo = resp.read()
