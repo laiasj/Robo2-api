@@ -192,12 +192,11 @@ import urllib.request
 
 TARGETS = [
     {"id": "cripto_coinbase", "categoria": "Financas e Cripto", "url": "https://api.coinbase.com/v2/prices/BTC-USD/spot"},
-    {"id": "mercado_yahoo", "categoria": "Financas e Mercados", "url": "https://finance.yahoo.com/news/rssindex"},
+    {"id": "mercado_cnbc", "categoria": "Financas e Mercados", "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"},
     {"id": "tech_hackernews", "categoria": "Tecnologia", "url": "https://news.ycombinator.com/rss"},
     {"id": "tech_theverge", "categoria": "Tecnologia", "url": "https://www.theverge.com/rss/index.xml"},
     {"id": "economia_bbc", "categoria": "Economia e Negocios", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"}
 ]
-
 @app.get("/radar")
 def verificar_categorias():
     resultados = []
