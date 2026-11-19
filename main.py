@@ -186,3 +186,38 @@ async def consultar(dados: ConsultaRequest):
         "payload_recebido": dados.payload,
         "dados": conteudo_extraido,
     }
+
+import json
+import urllib.request
+
+TARGETS = [
+    {"id": "cripto_coingecko", "categoria": "Finanças/Cripto", "url": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd"},
+    {"id": "cripto_coinbase", "categoria": "Finanças/Cripto", "url": "https://api.coinbase.com/v2/prices/BTC-USD/spot"},
+    {"id": "tech_hackernews", "categoria": "Tecnologia", "url": "https://news.ycombinator.com/rss"},
+    {"id": "mercado_binance", "categoria": "Mercado/Trade", "url": "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"},
+    {"id": "ecommerce_ml", "categoria": "E-commerce", "url": "https://api.mercadolibre.com/sites/MLB/search?q=notebook"}
+]
+
+@app.get("/radar")
+def verificar_categorias():
+    resultados = []
+    for alvo in TARGETS:
+        try:
+            req = urllib.request.Request(alvo["url"], headers={"User-Agent": "Robo2-Radar/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                conteudo = resp.read().decode("utf-8", errors="ignore")
+                resultados.append({
+                    "id": alvo["id"],
+                    "categoria": alvo["categoria"],
+                    "status": "online",
+                    "volume_dados": len(conteudo)
+                })
+        except Exception as e:
+            resultados.append({
+                "id": alvo["id"],
+                "categoria": alvo["categoria"],
+                "status": "erro",
+                "detalhe": str(e)
+            })
+    resultados.sort(key=lambda x: x.get("volume_dados", 0), reverse=True)
+    return {"ranking_movimento": resultados}
