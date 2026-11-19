@@ -199,9 +199,11 @@ TARGETS = [
     {"id": "economia_bbc", "categoria": "Economia e Negocios", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"}
 ]
 
+
 def garantir_tabela_radar():
     with get_db() as conn:
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS radar_historico (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 registrado_em TEXT NOT NULL,
@@ -211,8 +213,10 @@ def garantir_tabela_radar():
                 volume_dados INTEGER NOT NULL,
                 detalhe TEXT
             )
-        """)
+            """
+        )
         conn.commit()
+
 
 @app.get("/radar")
 def verificar_categorias():
@@ -266,6 +270,7 @@ def verificar_categorias():
         "registrado_em": agora,
         "ranking_movimento": resultados
     }
+
 
 @app.get("/radar/historico")
 def consultar_historico_radar(limite: int = 50):
