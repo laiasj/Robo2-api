@@ -98,7 +98,7 @@ def validar_admin(x_admin_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="Chave administrativa inválida.")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def home():
     return {"status": "online", "servico": "Robo2-api"}
 
