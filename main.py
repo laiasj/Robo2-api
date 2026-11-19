@@ -191,11 +191,11 @@ import json
 import urllib.request
 
 TARGETS = [
-    {"id": "cripto_coingecko", "categoria": "Finanças/Cripto", "url": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd"},
-    {"id": "cripto_coinbase", "categoria": "Finanças/Cripto", "url": "https://api.coinbase.com/v2/prices/BTC-USD/spot"},
+    {"id": "cripto_coinbase", "categoria": "Financas e Cripto", "url": "https://api.coinbase.com/v2/prices/BTC-USD/spot"},
+    {"id": "cripto_coincap", "categoria": "Financas e Cripto", "url": "https://api.coincap.io/v2/assets/bitcoin"},
     {"id": "tech_hackernews", "categoria": "Tecnologia", "url": "https://news.ycombinator.com/rss"},
-    {"id": "mercado_binance", "categoria": "Mercado/Trade", "url": "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"},
-    {"id": "ecommerce_ml", "categoria": "E-commerce", "url": "https://api.mercadolibre.com/sites/MLB/search?q=notebook"}
+    {"id": "tech_theverge", "categoria": "Tecnologia", "url": "https://www.theverge.com/rss/index.xml"},
+    {"id": "economia_bbc", "categoria": "Economia e Negocios", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"}
 ]
 
 @app.get("/radar")
@@ -203,7 +203,13 @@ def verificar_categorias():
     resultados = []
     for alvo in TARGETS:
         try:
-            req = urllib.request.Request(alvo["url"], headers={"User-Agent": "Robo2-Radar/1.0"})
+            req = urllib.request.Request(
+                alvo["url"],
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; Robo2-Radar/1.0)",
+                    "Accept": "*/*"
+                }
+            )
             with urllib.request.urlopen(req, timeout=8) as resp:
                 conteudo = resp.read().decode("utf-8", errors="ignore")
                 resultados.append({
