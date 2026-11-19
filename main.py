@@ -192,7 +192,7 @@ import urllib.request
 
 TARGETS = [
     {"id": "cripto_coinbase", "categoria": "Financas e Cripto", "url": "https://api.coinbase.com/v2/prices/BTC-USD/spot"},
-    {"id": "cripto_coincap", "categoria": "Financas e Cripto", "url": "https://api.coincap.io/v2/assets/bitcoin"},
+    {"id": "mercado_yahoo", "categoria": "Financas e Mercados", "url": "https://finance.yahoo.com/news/rssindex"},
     {"id": "tech_hackernews", "categoria": "Tecnologia", "url": "https://news.ycombinator.com/rss"},
     {"id": "tech_theverge", "categoria": "Tecnologia", "url": "https://www.theverge.com/rss/index.xml"},
     {"id": "economia_bbc", "categoria": "Economia e Negocios", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"}
