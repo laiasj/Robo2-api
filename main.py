@@ -11,10 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from solana.rpc.async_api import AsyncClient
-from solders.commitment_level import CommitmentLevel
 from solders.keypair import Keypair
-from solders.rpc.config import RpcSendTransactionConfig
 from solders.transaction import VersionedTransaction
 
 # ==============================================================================
@@ -118,6 +115,19 @@ def _load_keypair() -> Keypair | None:
     except Exception as exc:
         STATE["last_error"] = f"Chave privada inválida: {exc}"
         return None
+
+
+async def _rpc_call(method: str, params: list[Any]) -> dict[str, Any]:
+    assert http_client is not None
+    resp = await http_client.post(
+        SOLANA_RPC_URL,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(str(data["error"]))
+    return data
 
 
 # ==============================================================================
@@ -299,41 +309,50 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
 
         raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_tx_b64))
         signed_tx = VersionedTransaction(raw_tx.message, [kp])
+        signed_tx_b64 = base64.b64encode(bytes(signed_tx)).decode("ascii")
 
-        async with AsyncClient(SOLANA_RPC_URL) as rpc:
-            sim = await rpc.simulate_transaction(signed_tx)
-            if sim.value.err is not None:
-                err_msg = f"Simulação falhou: {sim.value.err}"
-                _record_op("FALHA", route_label, req.notional_usdc, err_msg)
-                return {"ok": False, "status": "FALHA", "reason": err_msg}
+        # Simulação obrigatória no RPC antes de enviar
+        sim_data = await _rpc_call(
+            "simulateTransaction",
+            [signed_tx_b64, {"encoding": "base64", "commitment": "confirmed"}],
+        )
+        sim_err = sim_data.get("result", {}).get("value", {}).get("err")
+        if sim_err is not None:
+            err_msg = f"Simulação falhou: {sim_err}"
+            _record_op("FALHA", route_label, req.notional_usdc, err_msg)
+            return {"ok": False, "status": "FALHA", "reason": err_msg}
 
-            if req.dry_run:
-                msg = f"Simulação OK | Lucro est.: ${expected_profit}"
-                _record_op("APROVADA", route_label, req.notional_usdc, msg)
-                return {
-                    "ok": True,
-                    "status": "SIMULADA_OK",
-                    "expected_profit_usdc": expected_profit,
-                    "detail": msg,
-                }
-
-            sent = await rpc.send_raw_transaction(
-                bytes(signed_tx),
-                opts=RpcSendTransactionConfig(
-                    skip_preflight=False,
-                    preflight_commitment=CommitmentLevel.Confirmed,
-                ),
-            )
-            tx_sig = str(sent.value)
-            STATE["stats"]["profit_usdc"] = round(STATE["stats"]["profit_usdc"] + max(expected_profit, 0.0), 4)
-            msg = f"TX enviada: {tx_sig[:12]}... | Lucro est.: ${expected_profit}"
+        if req.dry_run:
+            msg = f"Simulação OK | Lucro est.: ${expected_profit}"
             _record_op("APROVADA", route_label, req.notional_usdc, msg)
             return {
                 "ok": True,
-                "status": "ENVIADA",
-                "tx_signature": tx_sig,
+                "status": "SIMULADA_OK",
                 "expected_profit_usdc": expected_profit,
+                "detail": msg,
             }
+
+        send_data = await _rpc_call(
+            "sendTransaction",
+            [
+                signed_tx_b64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": False,
+                    "preflightCommitment": "confirmed",
+                },
+            ],
+        )
+        tx_sig = str(send_data.get("result", ""))
+        STATE["stats"]["profit_usdc"] = round(STATE["stats"]["profit_usdc"] + max(expected_profit, 0.0), 4)
+        msg = f"TX enviada: {tx_sig[:12]}... | Lucro est.: ${expected_profit}"
+        _record_op("APROVADA", route_label, req.notional_usdc, msg)
+        return {
+            "ok": True,
+            "status": "ENVIADA",
+            "tx_signature": tx_sig,
+            "expected_profit_usdc": expected_profit,
+        }
 
     except Exception as exc:
         err_msg = f"Erro na execução: {exc}"
