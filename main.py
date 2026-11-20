@@ -18,9 +18,11 @@ PAY_TO_ADDRESS = os.getenv("PAY_TO_ADDRESS", "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWV
 PRECO_USDC = float(os.getenv("PRECO_USDC", "0.01"))
 USDC_MINT_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-INTERVALO_VARREDURA_SEG = int(os.getenv("INTERVALO_VARREDURA_SEG", "180"))  # 3 minutos
-COOLDOWN_WEBHOOK_SEG = int(os.getenv("COOLDOWN_WEBHOOK_SEG", "240"))       # 4 min por código de fissura
-MAX_FALHAS_WEBHOOK = int(os.getenv("MAX_FALHAS_WEBHOOK", "5"))             # Pausa após 5 falhas seguidas
+INTERVALO_BASE_SEG = int(os.getenv("INTERVALO_BASE_SEG", "240"))        # 4 min base adaptativa
+INTERVALO_MIN_SEG = int(os.getenv("INTERVALO_MIN_SEG", "90"))           # 1.5 min em momento quente
+INTERVALO_MAX_SEG = int(os.getenv("INTERVALO_MAX_SEG", "600"))          # 10 min em momento calmo
+COOLDOWN_WEBHOOK_SEG = int(os.getenv("COOLDOWN_WEBHOOK_SEG", "240"))     # 4 min por código de fissura
+MAX_FALHAS_WEBHOOK = int(os.getenv("MAX_FALHAS_WEBHOOK", "5"))           # Pausa após 5 falhas seguidas
 WEBHOOKS_ARQUIVO = os.getenv("WEBHOOKS_ARQUIVO", "webhooks.json")
 WEBHOOKS_PADRAO = [u.strip() for u in os.getenv("WEBHOOKS_PADRAO", "").split(",") if u.strip()]
 REDE_PAGAMENTO = "solana"
@@ -40,7 +42,7 @@ COINS_DEFILLAMA = (
     "coingecko:bitcoin,coingecko:ethereum,coingecko:solana,coingecko:usd-coin,"
     "coingecko:arbitrum,coingecko:sui,coingecko:avalanche-2,coingecko:chainlink"
 )
-QUERIES_DEXSCREENER = ["solana", "ethereum", "base", "arbitrum"]
+QUERIES_DEXSCREENER = ["solana", "ethereum"]
 PALAVRAS_CHAVE_SINAL = ["sec", "etf", "fed", "hack", "outage", "solana", "bitcoin", "openai", "crash", "rate", "inflation"]
 
 METRICAS = {
@@ -57,9 +59,13 @@ METRICAS = {
 
 ESTADO_VIGILANCIA = {
     "ultima_varredura_brt": "Ainda não executada",
+    "proximo_intervalo_seg": INTERVALO_BASE_SEG,
+    "estrategia_ritmo": "EQUILIBRADO",
     "ultimo_btc_coinbase": None,
     "ultimo_btc_llama": None,
     "falhas_consecutivas_fonte": {t["id"]: 0 for t in TARGETS},
+    "fonte_pausada_ate": {t["id"]: 0.0 for t in TARGETS},
+    "rpc_pausado_ate": 0.0,
     "ultimos_titulos_vistos": deque(maxlen=80),
     "fissuras_ativas": deque(maxlen=40),
     "cache_coleta": {},
@@ -155,7 +161,6 @@ def registrar_evento(tipo: str, detalhe: str, valor_usdc: float = 0.0, status: s
 
 
 def _enviar_webhook_com_retentativa(hook: dict, codigo: str, payload_bytes: bytes):
-    """Envia POST para o assinante com 1 retentativa automática e controle de saúde."""
     url_hook = hook["url"]
     cliente_rotulo = hook.get("cliente_id") or "agente"
     ultimo_erro = ""
@@ -170,7 +175,7 @@ def _enviar_webhook_com_retentativa(hook: dict, codigo: str, payload_bytes: byte
                     "Content-Type": "application/json",
                     "X-Robo2-Cliente": cliente_rotulo,
                     "X-Robo2-Evento": codigo,
-                    "User-Agent": "Robo2-Autonomous-Webhook/2.8"
+                    "User-Agent": "Robo2-Autonomous-Webhook/2.9"
                 }
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -211,7 +216,6 @@ def _enviar_webhook_com_retentativa(hook: dict, codigo: str, payload_bytes: byte
 
 
 def despachar_webhooks_fissura(evento_fissura: dict):
-    """Dispara webhooks autônomos em threads paralelas sem bloquear o robô."""
     gravidade = evento_fissura.get("gravidade", "")
     codigo = evento_fissura.get("codigo", "")
 
@@ -235,7 +239,7 @@ def despachar_webhooks_fissura(evento_fissura: dict):
     ESTADO_VIGILANCIA["ultimo_envio_por_codigo"][codigo] = agora
     payload_bytes = json.dumps({
         "servico": "Robo2 Signals API",
-        "versao": "2.8.0",
+        "versao": "2.9.0",
         "tipo_mensagem": "alerta_fissura_autonomo",
         "emitido_em": datetime.now(BRT).isoformat(),
         "pagamento_x402": {
@@ -274,7 +278,11 @@ def registrar_fissura(codigo: str, gravidade: str, origem: str, detalhe: str, su
     return evento_fissura
 
 
-def consultar_saldo_solana_usdc() -> dict:
+def consultar_saldo_solana_usdc(forcar: bool = False) -> dict:
+    agora = time.time()
+    if not forcar and agora < ESTADO_VIGILANCIA.get("rpc_pausado_ate", 0.0):
+        return {"ok": True, "saldo_usdc": 0.0, "em_resfriamento": True}
+
     try:
         rpc_body = json.dumps({
             "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
@@ -287,8 +295,11 @@ def consultar_saldo_solana_usdc() -> dict:
             float(c.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {}).get("uiAmount") or 0)
             for c in contas
         )
+        ESTADO_VIGILANCIA["rpc_pausado_ate"] = 0.0
         return {"ok": True, "saldo_usdc": round(saldo, 4)}
     except Exception:
+        # Esfria consulta de saldo por 5 min para não ficar repetindo erro de RPC a toda hora
+        ESTADO_VIGILANCIA["rpc_pausado_ate"] = agora + 300
         return {"ok": False, "saldo_usdc": 0.0}
 
 
@@ -338,7 +349,7 @@ def validar_pagamento_solana_usdc(assinatura_tx: str) -> tuple[bool, str]:
 
 def extrair_defillama(limite: int = 10):
     url_llama = f"https://coins.llama.fi/prices/current/{COINS_DEFILLAMA}"
-    req = urllib.request.Request(url_llama, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.8)"})
+    req = urllib.request.Request(url_llama, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.9)"})
     with urllib.request.urlopen(req, timeout=8) as resp:
         coins = json.loads(resp.read().decode("utf-8")).get("coins", {})
 
@@ -361,11 +372,13 @@ def extrair_defillama(limite: int = 10):
     return itens[:limite]
 
 
-def extrair_dexscreener(limite: int = 10):
+def extrair_dexscreener(limite: int = 8):
     itens = []
-    for termo in QUERIES_DEXSCREENER:
+    for idx, termo in enumerate(QUERIES_DEXSCREENER):
+        if idx > 0:
+            time.sleep(1.2)
         url_dex = f"https://api.dexscreener.com/latest/dex/search?q={termo}"
-        req = urllib.request.Request(url_dex, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.8)"})
+        req = urllib.request.Request(url_dex, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.9)"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             pares = json.loads(resp.read().decode("utf-8")).get("pairs", [])[:2]
 
@@ -390,9 +403,9 @@ def extrair_itens_feed(url: str, limite: int = 5):
     if url == "descentralizado://defillama":
         return extrair_defillama(limite=max(limite, 8))
     if url == "descentralizado://dexscreener":
-        return extrair_dexscreener(limite=max(limite, 8))
+        return extrair_dexscreener(limite=max(limite, 6))
 
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.8)", "Accept": "*/*"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.9)", "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=8) as resp:
         raw = resp.read().decode("utf-8", errors="ignore")
 
@@ -432,11 +445,38 @@ def extrair_itens_feed(url: str, limite: int = 5):
     return itens
 
 
+def _calcular_proximo_intervalo(teve_oportunidade: bool, teve_bloqueio_429: bool) -> tuple[int, str]:
+    """Decide autonomamente quando será a próxima varredura com base no mercado e em bloqueios."""
+    hora = datetime.now(BRT).hour
+    fator_horario = 0.85 if 8 <= hora <= 22 else 1.35
+
+    if teve_bloqueio_429:
+        prox = min(INTERVALO_MAX_SEG, int(max(INTERVALO_BASE_SEG * 1.5, ESTADO_VIGILANCIA["proximo_intervalo_seg"] * 1.4)))
+        return prox, "RESFRIANDO (429)"
+
+    if teve_oportunidade:
+        prox = max(INTERVALO_MIN_SEG, int(INTERVALO_MIN_SEG * fator_horario))
+        return prox, "JANELA QUENTE"
+
+    prox = int(max(INTERVALO_MIN_SEG, min(INTERVALO_MAX_SEG, INTERVALO_BASE_SEG * fator_horario)))
+    estrategia = "MERCADO ATIVO" if 8 <= hora <= 22 else "MODO ECONÔMICO"
+    return prox, estrategia
+
+
 def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
     fissuras_novas = []
     total_sinais_coletados = 0
+    teve_oportunidade = False
+    teve_bloqueio_429 = False
+    agora_ts = time.time()
 
     for alvo in TARGETS:
+        if agora_ts < ESTADO_VIGILANCIA["fonte_pausada_ate"].get(alvo["id"], 0.0):
+            cache_resfriado = ESTADO_VIGILANCIA["cache_coleta"].get(alvo["id"])
+            if cache_resfriado:
+                total_sinais_coletados += cache_resfriado.get("total_itens", 0)
+            continue
+
         inicio = time.time()
         try:
             itens = extrair_itens_feed(alvo["url"], limite=6)
@@ -445,14 +485,16 @@ def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
             if not itens:
                 ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] += 1
                 if ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] >= 2:
+                    ESTADO_VIGILANCIA["fonte_pausada_ate"][alvo["id"]] = agora_ts + 420
                     fissuras_novas.append(registrar_fissura(
                         "FONTE_VAZIA", "critico", alvo["id"],
-                        f"{alvo['fonte']} retornou 0 itens seguidos.",
+                        f"{alvo['fonte']} retornou 0 itens (em resfriamento 7m).",
                         "Servir último cache válido aos agentes."
                     ))
                 continue
 
             ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] = 0
+            ESTADO_VIGILANCIA["fonte_pausada_ate"][alvo["id"]] = 0.0
             ESTADO_VIGILANCIA["cache_coleta"][alvo["id"]] = {
                 "id": alvo["id"],
                 "fonte": alvo["fonte"],
@@ -478,6 +520,7 @@ def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
                 if anterior_cb:
                     var_pct = ((atual_cb - anterior_cb) / anterior_cb) * 100
                     if abs(var_pct) >= 1.2:
+                        teve_oportunidade = True
                         fissuras_novas.append(registrar_fissura(
                             "BTC_VOLATILIDADE", "oportunidade", "crypto_btc_usd",
                             f"BTC variou {var_pct:+.2f}% (${anterior_cb:.2f} -> ${atual_cb:.2f}).",
@@ -489,6 +532,7 @@ def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
                 for it in itens:
                     var24 = abs(float(it.get("var_24h", 0)))
                     if var24 >= 15.0:
+                        teve_oportunidade = True
                         fissuras_novas.append(registrar_fissura(
                             "DEX_MOVIMENTO_FORTE", "oportunidade", "dexscreener_redes",
                             f"Movimento forte detectado: {it['titulo'][:85]}",
@@ -502,6 +546,7 @@ def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
                     if titulo not in ESTADO_VIGILANCIA["ultimos_titulos_vistos"]:
                         ESTADO_VIGILANCIA["ultimos_titulos_vistos"].append(titulo)
                         if any(p in titulo.lower() for p in PALAVRAS_CHAVE_SINAL):
+                            teve_oportunidade = True
                             fissuras_novas.append(registrar_fissura(
                                 "SINAL_MACRO_IMPACTO", "oportunidade", alvo["id"],
                                 f"Manchete relevante: {titulo[:90]}",
@@ -509,12 +554,21 @@ def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
                             ))
 
         except Exception as e:
+            erro_str = str(e)
+            is_429 = "429" in erro_str or "Too Many Requests" in erro_str
+            if is_429:
+                teve_bloqueio_429 = True
+
             ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] += 1
             if ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] >= 2:
+                fator_falha = min(4, ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]])
+                pausa_seg = (600 if is_429 else 300) * fator_falha
+                ESTADO_VIGILANCIA["fonte_pausada_ate"][alvo["id"]] = agora_ts + pausa_seg
                 fissuras_novas.append(registrar_fissura(
-                    "FONTE_OFFLINE", "critico", alvo["id"],
-                    f"Falha consecutiva em {alvo['fonte']}: {str(e)[:60]}",
-                    "Isolar fonte com erro e manter entrega pelas demais."
+                    "FONTE_BLOQUEADA_429" if is_429 else "FONTE_OFFLINE",
+                    "critico", alvo["id"],
+                    f"{alvo['fonte']} em resfriamento ({pausa_seg // 60}m): {erro_str[:55]}",
+                    "Fonte pausada temporariamente para evitar bloqueio contínuo."
                 ))
 
     btc_cb = ESTADO_VIGILANCIA["ultimo_btc_coinbase"]
@@ -522,31 +576,21 @@ def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
     if btc_cb and btc_ll and btc_cb > 0:
         spread_pct = abs((btc_cb - btc_ll) / btc_cb) * 100
         if spread_pct >= 0.6:
+            teve_oportunidade = True
             fissuras_novas.append(registrar_fissura(
                 "DIVERGENCIA_CEX_DEX", "oportunidade", "arbitragem_btc",
                 f"Spread BTC Coinbase (${btc_cb:.2f}) vs DefiLlama (${btc_ll:.2f}): {spread_pct:.2f}%.",
                 "Sinal de arbitragem pronto para agentes."
             ))
 
-    if METRICAS["total_cobrancas_402"] >= 5 and METRICAS["total_vendas_pagas"] == 0:
-        fissuras_novas.append(registrar_fissura(
-            "FUNIL_402_TRAVADO", "aviso", "x402_checkout",
-            f"{METRICAS['total_cobrancas_402']} cobranças 402 geradas e 0 aprovadas.",
-            "Conferir cabeçalho PAYMENT-REQUIRED ou RPC Solana."
-        ))
-
-    saldo_check = consultar_saldo_solana_usdc()
-    if not saldo_check.get("ok"):
-        fissuras_novas.append(registrar_fissura(
-            "RPC_SOLANA_INSTAVEL", "critico", "solana_rpc",
-            "Falha ao consultar RPC da Solana.",
-            "Verificar SOLANA_RPC_URL no Render."
-        ))
-
+    prox_seg, estrategia = _calcular_proximo_intervalo(teve_oportunidade, teve_bloqueio_429)
+    ESTADO_VIGILANCIA["proximo_intervalo_seg"] = prox_seg
+    ESTADO_VIGILANCIA["estrategia_ritmo"] = estrategia
     ESTADO_VIGILANCIA["ultima_varredura_brt"] = hora_atual_brt()
+
     registrar_evento(
         f"VARREDURA ({origem_gatilho})",
-        f"{len(TARGETS)} fontes varridas • {total_sinais_coletados} sinais frescos • {len(fissuras_novas)} fissuras",
+        f"{len(TARGETS)} fontes • {total_sinais_coletados} sinais • próximo em {prox_seg}s ({estrategia})",
         total_sinais_coletados,
         "saida"
     )
@@ -554,6 +598,8 @@ def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
         "varrido_em": ESTADO_VIGILANCIA["ultima_varredura_brt"],
         "sinais_coletados": total_sinais_coletados,
         "fissuras_detectadas": len(fissuras_novas),
+        "proximo_intervalo_seg": prox_seg,
+        "estrategia_ritmo": estrategia,
         "fissuras": fissuras_novas
     }
 
@@ -565,7 +611,7 @@ async def loop_vigilancia_background():
             await asyncio.to_thread(executar_varredura_proativa, "AUTO")
         except Exception as e:
             registrar_evento("ERRO LOOP", f"Falha na varredura automática: {str(e)[:70]}", 0.0, "erro")
-        await asyncio.sleep(INTERVALO_VARREDURA_SEG)
+        await asyncio.sleep(ESTADO_VIGILANCIA.get("proximo_intervalo_seg", INTERVALO_BASE_SEG))
 
 
 @asynccontextmanager
@@ -578,8 +624,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Robo2 Signals API",
-    description="API proativa de sinais estruturados em tempo real (Economia, Tech e Redes Descentralizadas) via x402 em USDC (Solana) com Webhooks Autônomos.",
-    version="2.8.0",
+    description="API proativa e adaptativa de sinais estruturados em tempo real via x402 em USDC (Solana) com Webhooks Autônomos.",
+    version="2.9.0",
     lifespan=lifespan
 )
 
@@ -618,8 +664,10 @@ def root():
     return {
         "status": "online",
         "servico": "Robo2 Signals API",
-        "versao": "2.8.0",
-        "modo": "proativo_webhook_autonomo",
+        "versao": "2.9.0",
+        "modo": "autonomo_adaptativo",
+        "estrategia_ritmo": ESTADO_VIGILANCIA["estrategia_ritmo"],
+        "proximo_intervalo_seg": ESTADO_VIGILANCIA["proximo_intervalo_seg"],
         "ultima_varredura": ESTADO_VIGILANCIA["ultima_varredura_brt"],
         "moeda": MOEDA_PAGAMENTO,
         "rede": REDE_PAGAMENTO,
@@ -691,10 +739,9 @@ def registrar_webhook(dados: WebhookCadastro):
     salvar_webhooks_disco()
     registrar_evento(f"WEBHOOK {acao.upper()}", f"[{cliente_id}] {url_limpa}", 0.0, "chamada")
 
-    # Envio imediato de boas-vindas em thread separada para confirmar entrega ao assinante
     boas_vindas = json.dumps({
         "servico": "Robo2 Signals API",
-        "versao": "2.8.0",
+        "versao": "2.9.0",
         "tipo_mensagem": "assinatura_confirmada",
         "emitido_em": datetime.now(BRT).isoformat(),
         "pagamento_x402": {
@@ -750,7 +797,7 @@ def listar_fissuras(executar_agora: bool = Query(default=False)):
 
 @app.get("/api/metricas")
 def obter_metricas():
-    carteira = consultar_saldo_solana_usdc()
+    carteira = consultar_saldo_solana_usdc(forcar=False)
     horas_ordenadas = sorted(METRICAS["historico_horas"].values(), key=lambda x: x["hora"])[-8:]
     with LOCK_WEBHOOKS:
         lista_hooks = list(ESTADO_VIGILANCIA["webhooks_inscritos"])
@@ -758,6 +805,8 @@ def obter_metricas():
         "hora_agora": hora_atual_brt(),
         "iniciado_em": METRICAS["iniciado_em_brt"],
         "ultima_varredura": ESTADO_VIGILANCIA["ultima_varredura_brt"],
+        "estrategia_ritmo": ESTADO_VIGILANCIA["estrategia_ritmo"],
+        "proximo_intervalo_seg": ESTADO_VIGILANCIA["proximo_intervalo_seg"],
         "carteira": PAY_TO_ADDRESS,
         "saldo_usdc": carteira.get("saldo_usdc", 0.0),
         "receita_sessao_usdc": round(METRICAS["receita_sessao_usdc"], 4),
@@ -845,6 +894,7 @@ def dashboard_visual():
     <div class="top">
       <div class="titulo"><span class="ponto"></span> Robo2 Signals — Monitor Autônomo</div>
       <div class="acoes-topo">
+        <div class="hora-box" id="ritmo-topo">Ritmo: --</div>
         <div class="hora-box" id="varredura-topo">Varredura: --:--:--</div>
         <div class="hora-box" id="hora-topo">Hora: --:--:--</div>
         <button class="btn-varrer" id="btn-varrer" onclick="forcarVarredura()">Varrer Agora</button>
@@ -1035,6 +1085,7 @@ def dashboard_visual():
         const r = await fetch('/api/metricas');
         const d = await r.json();
 
+        document.getElementById('ritmo-topo').textContent = 'Ritmo: ' + (d.estrategia_ritmo || '--') + ' (' + (d.proximo_intervalo_seg || '--') + 's)';
         document.getElementById('hora-topo').textContent = 'Hora: ' + d.hora_agora;
         document.getElementById('varredura-topo').textContent = 'Última varredura: ' + d.ultima_varredura;
         document.getElementById('saldo').textContent = '$' + Number(d.saldo_usdc).toFixed(2);
@@ -1123,11 +1174,12 @@ def well_known_agent(request: Request):
     base = str(request.base_url).rstrip("/")
     return {
         "name": "Robo2 Signals API",
-        "version": "2.8.0",
+        "version": "2.9.0",
         "autonomous_scanning": True,
+        "adaptive_rhythm": True,
         "autonomous_webhooks": True,
         "payment": {"protocol": "x402", "network": REDE_PAGAMENTO, "currency": MOEDA_PAGAMENTO, "payTo": PAY_TO_ADDRESS, "priceUSDC": PRECO_USDC},
-        "capabilities": ["macro_tech_news", "multichain_dex_prices", "fissure_detection", "autonomous_push_webhooks"],
+        "capabilities": ["macro_tech_news", "multichain_dex_prices", "fissure_detection", "adaptive_backoff", "autonomous_push_webhooks"],
         "endpoints": {
             "signals_paid": f"{base}/radar/itens",
             "fissures": f"{base}/api/fissuras",
@@ -1146,7 +1198,7 @@ def well_known_ai_plugin(request: Request):
         "schema_version": "v1",
         "name_for_human": "Robo2 Signals API",
         "name_for_model": "robo2_signals",
-        "description_for_human": "Sinais de Economia, Tech e Redes Descentralizadas via x402 USDC com Webhooks Autônomos.",
+        "description_for_human": "Sinais de Economia, Tech e Redes Descentralizadas via x402 USDC com Ritmo Adaptativo e Webhooks Autônomos.",
         "description_for_model": "Fetches structured economy, tech, decentralized crypto markets, and anomaly signals via GET /radar/itens with x402 USDC payment on Solana, and subscribes autonomous agents via POST /webhooks/registrar.",
         "auth": {"type": "none"},
         "api": {"type": "openapi", "url": f"{base}/openapi.json"}
@@ -1168,7 +1220,7 @@ def verificar_radar():
             })
             continue
         try:
-            req = urllib.request.Request(alvo["url"], headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.8)"})
+            req = urllib.request.Request(alvo["url"], headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.9)"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 conteudo = resp.read()
                 total_kb += max(1, len(conteudo) // 1024)
