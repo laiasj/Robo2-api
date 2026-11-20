@@ -7,13 +7,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TxOpts
+from solders.commitment_level import CommitmentLevel
 from solders.keypair import Keypair
+from solders.rpc.config import RpcSendTransactionConfig
 from solders.transaction import VersionedTransaction
 
 # ==============================================================================
@@ -132,7 +133,6 @@ async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str
     one_unit = 10**decimals
 
     try:
-        # 1. Preço de referência CoinGecko
         cg_resp = await client.get(
             COINGECKO_PRICE_URL,
             params={"ids": cg_id, "vs_currencies": "usd"},
@@ -140,7 +140,6 @@ async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str
         cg_resp.raise_for_status()
         ref_price = float(cg_resp.json()[cg_id]["usd"])
 
-        # 2. Cotação real de saída na Jupiter (1 unidade -> USDC)
         jup_resp = await client.get(
             JUPITER_QUOTE_URL,
             params={
@@ -250,10 +249,9 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
 
     assert http_client is not None
     target_mint, _ = MINTS[asset]
-    amount_in_atomic = int(req.notional_usdc * 1_000_000)  # USDC tem 6 decimais
+    amount_in_atomic = int(req.notional_usdc * 1_000_000)
 
     try:
-        # Passo 1: Cotação ida (USDC -> Ativo)
         q1 = await http_client.get(
             JUPITER_QUOTE_URL,
             params={
@@ -267,7 +265,6 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
         quote1 = q1.json()
         mid_amount = int(quote1["outAmount"])
 
-        # Passo 2: Cotação volta (Ativo -> USDC)
         q2 = await http_client.get(
             JUPITER_QUOTE_URL,
             params={
@@ -287,7 +284,6 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
             _record_op("RECUSADA", route_label, req.notional_usdc, msg)
             return {"ok": False, "status": "RECUSADA", "reason": msg, "expected_profit_usdc": expected_profit}
 
-        # Passo 3: Monta transação de swap via Jupiter
         swap_resp = await http_client.post(
             JUPITER_SWAP_URL,
             json={
@@ -304,7 +300,6 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
         raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_tx_b64))
         signed_tx = VersionedTransaction(raw_tx.message, [kp])
 
-        # Passo 4: Simulação obrigatória no RPC antes de enviar
         async with AsyncClient(SOLANA_RPC_URL) as rpc:
             sim = await rpc.simulate_transaction(signed_tx)
             if sim.value.err is not None:
@@ -322,10 +317,12 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
                     "detail": msg,
                 }
 
-            # Envio real para a rede Solana
             sent = await rpc.send_raw_transaction(
                 bytes(signed_tx),
-                opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"),
+                opts=RpcSendTransactionConfig(
+                    skip_preflight=False,
+                    preflight_commitment=CommitmentLevel.Confirmed,
+                ),
             )
             tx_sig = str(sent.value)
             STATE["stats"]["profit_usdc"] = round(STATE["stats"]["profit_usdc"] + max(expected_profit, 0.0), 4)
@@ -360,7 +357,6 @@ async def _oracle_loop() -> None:
 
         _compute_routes()
 
-        # Execução automática apenas se AUTO_EXECUTE=true e houver sinal positivo
         exec_sig = STATE["execution_signal"]
         if AUTO_EXECUTE and exec_sig["positive"] and exec_sig["best_route"]:
             best_asset = exec_sig["best_route"]["asset"]
