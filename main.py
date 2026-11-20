@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from web3 import Web3
 
 load_dotenv()
@@ -26,11 +26,10 @@ TRACKED_ASSETS = [
     if a.strip()
 ]
 
-# Pools públicas descentralizadas (DEX) para consulta aberta sem corretora centralizada
+# Pools públicas descentralizadas (DEX) verificadas para consulta aberta
 DEX_PUBLIC_POOLS: dict[str, tuple[str, str]] = {
-    "BTC": ("eth", "0x4585fe77224b41ba6f8926bd32fc762de9785ec0"),   # WBTC/WETH pool pública DEX
-    "ETH": ("base", "0x4c363738849e3820dc1c330d44bf24bc94a7e9de"),  # WETH/USDC pool pública DEX
-    "SOL": ("solana", "c8xrqszs22k39zfnq3m435t8v5h1t742y8j9w7g8v1e"),
+    "BTC": ("eth", "0x4585fe77224b41ba6f8926bd32fc762de9785ec0"),
+    "ETH": ("base", "0x4c363738849e3820dc1c330d44bf24bc94a7e9de"),
     "LINK": ("base", "0x6d615c87e645b687b59e6a8d2c6a98a8b24f682f"),
 }
 
@@ -57,7 +56,7 @@ ACCEPTED_TOKENS: dict[str, dict[str, Any]] = {
 # =====================================================================
 # 2. ESTADO DO ROBO2 & CONEXÃO ON-CHAIN
 # =====================================================================
-w3 = Web3(Web3.HTTPProvider(RPC_URL))
+w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 8}))
 TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)").hex().lower()
 USED_TX_HASHES: set[str] = set()
 
@@ -67,6 +66,7 @@ ROBO2_STATE: dict[str, Any] = {
     "status": "starting",
     "started_at": int(time.time()),
     "last_update": 0,
+    "last_error": None,
     "total_paid_requests": 0,
     "revenue_by_token": {"USDC": 0.0, "LINK": 0.0},
     "signals": {},
@@ -87,42 +87,48 @@ def _normalize_symbol(symbol: str) -> str:
     return clean
 
 
+def _build_quote(provider: str, asset: str, price_usd: float, change_24h: float, now_ts: int) -> dict[str, Any]:
+    spread_proxy = round(min(abs(change_24h) * 0.001, 2.5), 5)
+    mid = round(price_usd, 6)
+    half_gap = mid * (spread_proxy / 100.0) if spread_proxy > 0 else mid * 0.0002
+    bid = round(max(0.0, mid - half_gap), 6)
+    ask = round(mid + half_gap, 6)
+    return {
+        "provider": provider,
+        "asset": asset,
+        "value": mid,
+        "bid": bid,
+        "ask": ask,
+        "spread_pct": spread_proxy,
+        "timestamp": now_ts,
+        "status": "live",
+    }
+
+
 async def fetch_dex_pool_snapshot(client: httpx.AsyncClient, asset: str) -> dict[str, Any] | None:
     norm = _normalize_symbol(asset)
     pool_cfg = DEX_PUBLIC_POOLS.get(norm)
     now_ts = int(time.time())
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; Robo2Signals/2.3)",
+    }
 
     if pool_cfg:
         network, pool_addr = pool_cfg
         url = f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool_addr}"
         try:
-            resp = await client.get(
-                url,
-                headers={"Accept": "application/json", "User-Agent": "Robo2-Public-DEX/2.2"},
-                timeout=6.0,
-            )
+            resp = await client.get(url, headers=headers, timeout=8.0)
             if resp.status_code == 200:
                 attrs = (resp.json().get("data") or {}).get("attributes") or {}
                 price_usd = float(attrs.get("base_token_price_usd") or 0.0)
                 if price_usd > 0:
                     change_24h = float((attrs.get("price_change_percentage") or {}).get("h24") or 0.0)
-                    spread_proxy = round(abs(change_24h) * 0.001, 5)
-                    mid = round(price_usd, 6)
-                    half_gap = mid * (spread_proxy / 100.0) if spread_proxy > 0 else mid * 0.0002
-                    bid = round(max(0.0, mid - half_gap), 6)
-                    ask = round(mid + half_gap, 6)
-                    return {
-                        "provider": f"Robo2 Public DEX ({network})",
-                        "asset": norm,
-                        "value": mid,
-                        "bid": bid,
-                        "ask": ask,
-                        "spread_pct": spread_proxy,
-                        "timestamp": now_ts,
-                        "status": "live",
-                    }
-        except Exception:
-            pass
+                    return _build_quote(f"GeckoTerminal ({network})", norm, price_usd, change_24h, now_ts)
+            else:
+                ROBO2_STATE["last_error"] = f"GeckoTerminal {norm}: HTTP {resp.status_code}"
+        except Exception as exc:
+            ROBO2_STATE["last_error"] = f"GeckoTerminal {norm}: {exc}"
 
     cg_id = COINGECKO_IDS.get(norm)
     if cg_id:
@@ -130,31 +136,24 @@ async def fetch_dex_pool_snapshot(client: httpx.AsyncClient, asset: str) -> dict
             resp = await client.get(
                 "https://api.coingecko.com/api/v3/simple/price",
                 params={"ids": cg_id, "vs_currencies": "usd", "include_24hr_change": "true"},
-                headers={"Accept": "application/json", "User-Agent": "Robo2-Public-DEX/2.2"},
-                timeout=6.0,
+                headers=headers,
+                timeout=8.0,
             )
             if resp.status_code == 200:
                 entry = resp.json().get(cg_id) or {}
                 price_usd = float(entry.get("usd") or 0.0)
                 if price_usd > 0:
                     change_24h = float(entry.get("usd_24h_change") or 0.0)
-                    spread_proxy = round(abs(change_24h) * 0.001, 5)
-                    mid = round(price_usd, 6)
-                    half_gap = mid * (spread_proxy / 100.0) if spread_proxy > 0 else mid * 0.0002
-                    bid = round(max(0.0, mid - half_gap), 6)
-                    ask = round(mid + half_gap, 6)
-                    return {
-                        "provider": "Robo2 Public Feed",
-                        "asset": norm,
-                        "value": mid,
-                        "bid": bid,
-                        "ask": ask,
-                        "spread_pct": spread_proxy,
-                        "timestamp": now_ts,
-                        "status": "live",
-                    }
-        except Exception:
-            pass
+                    return _build_quote("CoinGecko Public", norm, price_usd, change_24h, now_ts)
+            else:
+                ROBO2_STATE["last_error"] = f"CoinGecko {norm}: HTTP {resp.status_code}"
+        except Exception as exc:
+            ROBO2_STATE["last_error"] = f"CoinGecko {norm}: {exc}"
+
+    # Mantém último sinal válido se existir em cache
+    existing = ROBO2_STATE["signals"].get(norm)
+    if existing:
+        return {**existing, "timestamp": now_ts, "status": "cached"}
 
     return None
 
@@ -181,18 +180,24 @@ def rebuild_radar_items() -> list[dict[str, Any]]:
 
 
 async def background_collector_loop() -> None:
+    ROBO2_STATE["status"] = "online"
     async with httpx.AsyncClient() as client:
         while True:
             updated = False
             for asset in TRACKED_ASSETS:
-                snap = await fetch_dex_pool_snapshot(client, asset)
-                if snap:
-                    ROBO2_STATE["signals"][snap["asset"]] = snap
-                    updated = True
-                await asyncio.sleep(0.6)
+                try:
+                    snap = await fetch_dex_pool_snapshot(client, asset)
+                    if snap:
+                        ROBO2_STATE["signals"][snap["asset"]] = snap
+                        updated = True
+                except Exception as exc:
+                    ROBO2_STATE["last_error"] = f"Loop {asset}: {exc}"
+                await asyncio.sleep(1.2)
+
             if updated:
                 ROBO2_STATE["radar_items"] = rebuild_radar_items()
                 ROBO2_STATE["last_update"] = int(time.time())
+
             ROBO2_STATE["status"] = "online"
             await asyncio.sleep(COLLECT_INTERVAL_SECONDS)
 
@@ -204,9 +209,13 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
-app = FastAPI(title="Robo2 Signals & M2M Oracle", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="Robo2 Signals & M2M Oracle", version="2.3.0", lifespan=lifespan)
 
 
 # =====================================================================
@@ -481,7 +490,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <script>
     function fmtTime(ts) {
-      if (!ts) return "-";
+      if (!ts) return "--";
       return new Date(ts * 1000).toLocaleTimeString("pt-BR");
     }
 
@@ -548,12 +557,18 @@ async def dashboard() -> HTMLResponse:
     return HTMLResponse(content=DASHBOARD_HTML)
 
 
+@app.head("/")
+async def dashboard_head() -> Response:
+    return Response(status_code=200)
+
+
 @app.get("/api/status")
 async def api_status() -> dict[str, Any]:
     return {
         "service": ROBO2_STATE["service"],
         "source_mode": ROBO2_STATE["source_mode"],
         "status": ROBO2_STATE["status"],
+        "last_error": ROBO2_STATE["last_error"],
         "receiver_wallet": RECEIVER_WALLET,
         "solana_recipient": SOLANA_RECIPIENT,
         "last_update": ROBO2_STATE["last_update"],
@@ -570,6 +585,7 @@ async def health() -> dict[str, Any]:
         "status": ROBO2_STATE["status"],
         "source_mode": ROBO2_STATE["source_mode"],
         "last_update": ROBO2_STATE["last_update"],
+        "last_error": ROBO2_STATE["last_error"],
         "tracked_assets": TRACKED_ASSETS,
         "cached_assets": list(ROBO2_STATE["signals"].keys()),
     }
@@ -659,7 +675,7 @@ async def get_m2m_feed(
             },
         )
 
-    payment = verify_onchain_payment(proof)
+    payment = await asyncio.to_thread(verify_onchain_payment, proof)
     if not payment["valid"]:
         return JSONResponse(
             status_code=402,
