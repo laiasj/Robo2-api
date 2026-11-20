@@ -15,10 +15,9 @@ load_dotenv()
 # =====================================================================
 # 1. CONFIGURAÇÕES GERAIS E VARIÁVEIS DE AMBIENTE
 # =====================================================================
-RECEIVER_WALLET = os.getenv("RECEIVER_WALLET", "0xSuaCarteiraAqui").strip().lower()
-SOLANA_RECIPIENT = os.getenv(
-    "SOLANA_RECIPIENT", "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk"
-).strip()
+DEFAULT_WALLET = "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk"
+SOLANA_RECIPIENT = os.getenv("SOLANA_RECIPIENT", DEFAULT_WALLET).strip()
+RECEIVER_WALLET = os.getenv("RECEIVER_WALLET", DEFAULT_WALLET).strip()
 RPC_URL = os.getenv("RPC_URL", "https://mainnet.base.org").strip()
 COLLECT_INTERVAL_SECONDS = int(os.getenv("COLLECT_INTERVAL_SECONDS", "20"))
 TRACKED_ASSETS = [
@@ -152,19 +151,20 @@ def verify_onchain_payment(tx_hash: str) -> dict[str, Any]:
     if tx_clean in USED_TX_HASHES:
         return {"valid": False, "reason": "Hash de transação já utilizado"}
 
-    if not RECEIVER_WALLET.startswith("0x") or len(RECEIVER_WALLET) != 42:
-        return {"valid": False, "reason": "Carteira recebedora EVM não configurada"}
+    if not RECEIVER_WALLET:
+        return {"valid": False, "reason": "Carteira recebedora não configurada"}
 
     try:
         receipt = w3.eth.get_transaction_receipt(tx_clean)
         if not receipt or receipt.status != 1:
             return {"valid": False, "reason": "Transação não confirmada ou revertida"}
 
+        target_wallet = RECEIVER_WALLET.lower()
         for log in receipt.logs:
             topics = [t.hex().lower() if hasattr(t, "hex") else str(t).lower() for t in log.topics]
             if len(topics) >= 3 and topics[0] == TRANSFER_TOPIC:
                 to_addr = "0x" + topics[2][-40:]
-                if to_addr.lower() == RECEIVER_WALLET:
+                if to_addr.lower() == target_wallet:
                     contract_addr = log.address.lower()
                     for symbol, info in ACCEPTED_TOKENS.items():
                         if contract_addr == info["address"]:
@@ -290,7 +290,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       letter-spacing: 0.4px;
     }
     .kpi-val {
-      font-size: 1.08rem;
+      font-size: 1.02rem;
       font-weight: 700;
       margin-top: 3px;
       word-break: break-all;
@@ -485,6 +485,7 @@ async def api_status() -> dict[str, Any]:
         "service": ROBO2_STATE["service"],
         "status": ROBO2_STATE["status"],
         "receiver_wallet": RECEIVER_WALLET,
+        "solana_recipient": SOLANA_RECIPIENT,
         "last_update": ROBO2_STATE["last_update"],
         "total_paid_requests": ROBO2_STATE["total_paid_requests"],
         "revenue_by_token": ROBO2_STATE["revenue_by_token"],
@@ -570,6 +571,7 @@ async def get_m2m_feed(
                 "protocol": "x402",
                 "network": "base-mainnet",
                 "receiver": RECEIVER_WALLET,
+                "solana_recipient": SOLANA_RECIPIENT,
                 "accepted_payments": [
                     {
                         "token": "USDC",
