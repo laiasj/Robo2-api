@@ -6,19 +6,27 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, Query
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from web3 import Web3
 
 load_dotenv()
 
 # =====================================================================
-# 1. CONFIGURAÇÕES GERAIS E VARIÁVEIS DE AMBIENTE
+# 1. CONFIGURAÇÕES GERAIS, ORÁCULOS E PAGAMENTO (USDC + LINK)
 # =====================================================================
+APP_VERSION = "2.10.0"
+SERVICE_NAME = "Robo2 Signals - Autonomous Data API"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://robo2-api.onrender.com").rstrip("/")
+
 DEFAULT_WALLET = "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk"
-SOLANA_RECIPIENT = os.getenv("SOLANA_RECIPIENT", DEFAULT_WALLET).strip()
+SOLANA_PAY_TO = os.getenv("SOLANA_PAY_TO", DEFAULT_WALLET).strip()
 RECEIVER_WALLET = os.getenv("RECEIVER_WALLET", DEFAULT_WALLET).strip()
 RPC_URL = os.getenv("RPC_URL", "https://mainnet.base.org").strip()
+
+PRICE_USDC = os.getenv("PRICE_USDC", "0.01").strip()
+PRICE_LINK = os.getenv("PRICE_LINK", "0.0005").strip()
+
 COLLECT_INTERVAL_SECONDS = int(os.getenv("COLLECT_INTERVAL_SECONDS", "20"))
 TRACKED_ASSETS = [
     a.strip().upper()
@@ -26,7 +34,6 @@ TRACKED_ASSETS = [
     if a.strip()
 ]
 
-# Pools públicas descentralizadas (DEX) verificadas para consulta aberta
 DEX_PUBLIC_POOLS: dict[str, tuple[str, str]] = {
     "BTC": ("eth", "0x4585fe77224b41ba6f8926bd32fc762de9785ec0"),
     "ETH": ("base", "0x4c363738849e3820dc1c330d44bf24bc94a7e9de"),
@@ -44,12 +51,12 @@ ACCEPTED_TOKENS: dict[str, dict[str, Any]] = {
     "USDC": {
         "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".lower(),
         "decimals": 6,
-        "min_amount": float(os.getenv("PRICE_USDC", "0.01")),
+        "min_amount": float(PRICE_USDC),
     },
     "LINK": {
         "address": "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196".lower(),
         "decimals": 18,
-        "min_amount": float(os.getenv("PRICE_LINK", "0.0005")),
+        "min_amount": float(PRICE_LINK),
     },
 }
 
@@ -61,8 +68,8 @@ TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)").hex().lower
 USED_TX_HASHES: set[str] = set()
 
 ROBO2_STATE: dict[str, Any] = {
-    "service": "Robo2 Signals",
-    "source_mode": "public-dex-onchain",
+    "service": SERVICE_NAME,
+    "source_mode": "public-dex-oracle-x402",
     "status": "starting",
     "started_at": int(time.time()),
     "last_update": 0,
@@ -76,7 +83,7 @@ ROBO2_STATE: dict[str, Any] = {
 
 
 # =====================================================================
-# 3. COLETA PÚBLICA DESCENTRALIZADA (POOLS DEX + FALLBACK PÚBLICO)
+# 3. COLETA DESCENTRALIZADA PARA SINAIS, FISSURAS E ORÁCULOS
 # =====================================================================
 def _normalize_symbol(symbol: str) -> str:
     clean = symbol.strip().upper()
@@ -97,6 +104,7 @@ def _build_quote(provider: str, asset: str, price_usd: float, change_24h: float,
         "provider": provider,
         "asset": asset,
         "value": mid,
+        "price_usd": mid,
         "bid": bid,
         "ask": ask,
         "spread_pct": spread_proxy,
@@ -111,7 +119,7 @@ async def fetch_dex_pool_snapshot(client: httpx.AsyncClient, asset: str) -> dict
     now_ts = int(time.time())
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; Robo2Signals/2.3)",
+        "User-Agent": "Mozilla/5.0 (compatible; Robo2Signals/2.10)",
     }
 
     if pool_cfg:
@@ -150,7 +158,6 @@ async def fetch_dex_pool_snapshot(client: httpx.AsyncClient, asset: str) -> dict
         except Exception as exc:
             ROBO2_STATE["last_error"] = f"CoinGecko {norm}: {exc}"
 
-    # Mantém último sinal válido se existir em cache
     existing = ROBO2_STATE["signals"].get(norm)
     if existing:
         return {**existing, "timestamp": now_ts, "status": "cached"}
@@ -215,11 +222,11 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="Robo2 Signals & M2M Oracle", version="2.3.0", lifespan=lifespan)
+app = FastAPI(title=SERVICE_NAME, version=APP_VERSION, lifespan=lifespan)
 
 
 # =====================================================================
-# 4. VALIDAÇÃO DE PAGAMENTO ON-CHAIN (USDC + LINK)
+# 4. VALIDAÇÃO DE PAGAMENTO (USDC + LINK)
 # =====================================================================
 def verify_onchain_payment(tx_hash: str) -> dict[str, Any]:
     if not tx_hash:
@@ -270,8 +277,50 @@ def verify_onchain_payment(tx_hash: str) -> dict[str, Any]:
         return {"valid": False, "reason": f"Falha na consulta RPC: {exc}"}
 
 
+def _payment_required_response(resource_path: str, base_url: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=402,
+        content={
+            "x402Version": 1,
+            "error": "Payment Required",
+            "payTo": SOLANA_PAY_TO,
+            "receiver": RECEIVER_WALLET,
+            "resource": f"{base_url}{resource_path}",
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "solana",
+                    "maxAmountRequired": PRICE_USDC,
+                    "asset": "USDC",
+                    "payTo": SOLANA_PAY_TO,
+                    "resource": f"{base_url}{resource_path}",
+                },
+                {
+                    "scheme": "exact",
+                    "network": "base-mainnet",
+                    "maxAmountRequired": PRICE_USDC,
+                    "asset": "USDC",
+                    "contract": ACCEPTED_TOKENS["USDC"]["address"],
+                    "payTo": RECEIVER_WALLET,
+                    "resource": f"{base_url}{resource_path}",
+                },
+                {
+                    "scheme": "exact",
+                    "network": "base-mainnet",
+                    "maxAmountRequired": PRICE_LINK,
+                    "asset": "LINK",
+                    "contract": ACCEPTED_TOKENS["LINK"]["address"],
+                    "payTo": RECEIVER_WALLET,
+                    "resource": f"{base_url}{resource_path}",
+                },
+            ],
+            "instructions": "Envie pagamento em USDC ou LINK e inclua o comprovante no header X-Payment-Tx.",
+        },
+    )
+
+
 # =====================================================================
-# 5. PAINEL EM TEMPO REAL (ESTÉTICA CLARA, BEGE, LILÁS PASTEL E DOURADO)
+# 5. PAINEL EM TEMPO REAL
 # =====================================================================
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -324,23 +373,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       align-items: center;
       gap: 12px;
     }
-    h1 {
-      margin: 0;
-      font-size: 1.35rem;
-      letter-spacing: 0.2px;
-    }
-    h2 {
-      margin: 0 0 12px 0;
-      font-size: 1.02rem;
-      color: var(--ink);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
+    h1 { margin: 0; font-size: 1.35rem; }
+    h2 { margin: 0 0 12px 0; font-size: 1.02rem; display: flex; align-items: center; gap: 8px; }
     .pill {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
       padding: 4px 11px;
       border-radius: 999px;
       font-size: 0.78rem;
@@ -361,18 +398,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       border-radius: 10px;
       padding: 11px 13px;
     }
-    .kpi-label {
-      font-size: 0.76rem;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-    }
-    .kpi-val {
-      font-size: 1.02rem;
-      font-weight: 700;
-      margin-top: 3px;
-      word-break: break-all;
-    }
+    .kpi-label { font-size: 0.76rem; color: var(--muted); text-transform: uppercase; }
+    .kpi-val { font-size: 1.02rem; font-weight: 700; margin-top: 3px; word-break: break-all; }
     .tag-lilac {
       background: var(--lilac-soft);
       color: #5b4a96;
@@ -382,33 +409,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       font-size: 0.75rem;
       font-weight: 600;
     }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.9rem;
-    }
-    th, td {
-      text-align: left;
-      padding: 9px 10px;
-      border-bottom: 1px solid var(--line);
-    }
-    th {
-      color: var(--muted);
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-      background: var(--card-soft);
-    }
-    code {
-      background: var(--gold-soft);
-      padding: 2px 6px;
-      border-radius: 6px;
-      font-size: 0.82rem;
-    }
-    .footer-note {
-      font-size: 0.8rem;
-      color: var(--muted);
-    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; background: var(--card-soft); }
+    code { background: var(--gold-soft); padding: 2px 6px; border-radius: 6px; font-size: 0.82rem; }
+    .footer-note { font-size: 0.8rem; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -442,12 +447,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <p class="footer-note" style="margin-top: 12px; margin-bottom: 0;">
-        Rotas ativas: <code>/radar/itens</code> · <code>/api/v1/m2m/feed/{asset}</code> · <code>/.well-known/x402</code> · <code>/.well-known/agent.json</code>
+        Rotas ativas: <code>/radar/itens</code> · <code>/api/v1/oracle/feed/{asset}</code> · <code>/api/v1/m2m/feed/{asset}</code> · <code>/.well-known/x402</code> · <code>/.well-known/agent.json</code>
       </p>
     </div>
 
     <div class="card">
-      <h2>Sinais e Fissuras em Tempo Real <span class="tag-lilac">DEX LIVE</span></h2>
+      <h2>Sinais e Fissuras em Tempo Real <span class="tag-lilac">DEX &amp; ORACLE LIVE</span></h2>
       <div style="overflow-x:auto;">
         <table>
           <thead>
@@ -469,7 +474,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>Liquidações M2M Recentes</h2>
+      <h2>Liquidações M2M / Oráculo Recentes</h2>
       <div style="overflow-x:auto;">
         <table>
           <thead>
@@ -570,7 +575,7 @@ async def api_status() -> dict[str, Any]:
         "status": ROBO2_STATE["status"],
         "last_error": ROBO2_STATE["last_error"],
         "receiver_wallet": RECEIVER_WALLET,
-        "solana_recipient": SOLANA_RECIPIENT,
+        "solana_pay_to": SOLANA_PAY_TO,
         "last_update": ROBO2_STATE["last_update"],
         "total_paid_requests": ROBO2_STATE["total_paid_requests"],
         "revenue_by_token": ROBO2_STATE["revenue_by_token"],
@@ -595,85 +600,142 @@ async def health() -> dict[str, Any]:
 async def radar_itens(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
     items = ROBO2_STATE["radar_items"] or rebuild_radar_items()
     return {
-        "service": "Robo2 Signals",
+        "service": SERVICE_NAME,
         "count": len(items[:limit]),
         "last_update": ROBO2_STATE["last_update"],
         "items": items[:limit],
     }
 
 
-@app.get("/.well-known/x402")
-@app.get("/.well-known/x402.json")
-async def well_known_x402() -> dict[str, Any]:
-    return {
-        "protocol": "x402",
-        "version": "1.0",
-        "provider": "Robo2 Signals",
-        "description": "Sinais e fissuras de oportunidade em tempo real via M2M.",
-        "network": "base-mainnet",
-        "receiver": RECEIVER_WALLET,
-        "solana_recipient": SOLANA_RECIPIENT,
-        "endpoint_template": "/api/v1/m2m/feed/{asset}",
-        "radar_endpoint": "/radar/itens",
-        "payment_header": "X-Payment-Tx",
-        "accepted_tokens": ACCEPTED_TOKENS,
-    }
+# =====================================================================
+# 6. MANIFESTOS DE DESCOBERTA (x402, AGENT.JSON, AI-PLUGIN.JSON)
+# =====================================================================
+@app.get("/.well-known/x402", tags=["discovery", "x402"])
+async def well_known_x402(request: Request):
+    base_url = str(request.base_url).rstrip("/") if request.base_url else PUBLIC_BASE_URL
+    return JSONResponse(
+        content={
+            "x402Version": 1,
+            "name": SERVICE_NAME,
+            "version": APP_VERSION,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "solana",
+                    "maxAmountRequired": PRICE_USDC,
+                    "asset": "USDC",
+                    "payTo": SOLANA_PAY_TO,
+                    "resource": f"{base_url}/radar/itens",
+                    "description": "Sinais e oportunidades/fissuras monitoradas em tempo real pelo Robo2.",
+                    "mimeType": "application/json",
+                },
+                {
+                    "scheme": "exact",
+                    "network": "base-mainnet",
+                    "maxAmountRequired": PRICE_LINK,
+                    "asset": "LINK",
+                    "contract": ACCEPTED_TOKENS["LINK"]["address"],
+                    "payTo": RECEIVER_WALLET,
+                    "resource": f"{base_url}/api/v1/oracle/feed/ETH",
+                    "description": "Dados de preço, spread e fissuras para oráculos e agentes M2M.",
+                    "mimeType": "application/json",
+                },
+            ],
+            "endpoints": {
+                "data": f"{base_url}/radar/itens",
+                "oracle": f"{base_url}/api/v1/oracle/feed/ETH",
+                "m2m": f"{base_url}/api/v1/m2m/feed/ETH",
+                "agentManifest": f"{base_url}/.well-known/agent.json",
+                "openapi": f"{base_url}/openapi.json",
+            },
+        }
+    )
 
 
-@app.get("/.well-known/agent.json")
-async def well_known_agent() -> dict[str, Any]:
-    return {
-        "name": "Robo2 Signals",
-        "description": "Sinais e fissuras de oportunidade em tempo real via M2M.",
-        "endpoints": {
-            "dashboard": "/",
-            "radar": "/radar/itens",
-            "m2m_feed": "/api/v1/m2m/feed/{asset}",
-            "x402": "/.well-known/x402",
-        },
-        "payments": {
-            "evm_receiver": RECEIVER_WALLET,
-            "solana_recipient": SOLANA_RECIPIENT,
-            "accepted_tokens": ACCEPTED_TOKENS,
-        },
-    }
+@app.get("/.well-known/agent.json", tags=["discovery", "agents"])
+async def well_known_agent_json(request: Request):
+    base_url = str(request.base_url).rstrip("/") if request.base_url else PUBLIC_BASE_URL
+    return JSONResponse(
+        content={
+            "schema_version": "1.0",
+            "name": SERVICE_NAME,
+            "version": APP_VERSION,
+            "description": "Provedor autônomo de sinais, fissuras e feeds para oráculos com cobrança máquina-a-máquina via x402 em USDC e LINK.",
+            "url": base_url,
+            "capabilities": {
+                "autonomous_discovery": True,
+                "bot_to_bot_payment": True,
+                "oracle_data_feed": True,
+                "adaptive_rate_limiting": True,
+            },
+            "payment": {
+                "protocol": "x402",
+                "solana_pay_to": SOLANA_PAY_TO,
+                "evm_receiver": RECEIVER_WALLET,
+                "price_usdc": PRICE_USDC,
+                "price_link": PRICE_LINK,
+                "payment_endpoint": f"{base_url}/radar/itens",
+            },
+            "resources": [
+                {
+                    "path": "/radar/itens",
+                    "method": "GET",
+                    "auth_or_payment": "x402",
+                    "summary": "Retorna itens/sinais coletados e oportunidades detectadas.",
+                },
+                {
+                    "path": "/api/v1/oracle/feed/{asset}",
+                    "method": "GET",
+                    "auth_or_payment": "x402",
+                    "summary": "Fornece dados estruturados de preço, bid/ask e fissura para oráculos.",
+                },
+            ],
+            "discovery": {
+                "x402": f"{base_url}/.well-known/x402",
+                "openapi": f"{base_url}/openapi.json",
+            },
+        }
+    )
+
+
+@app.get("/.well-known/ai-plugin.json", tags=["discovery", "agents"])
+async def well_known_ai_plugin(request: Request):
+    base_url = str(request.base_url).rstrip("/") if request.base_url else PUBLIC_BASE_URL
+    return JSONResponse(
+        content={
+            "schema_version": "v1",
+            "name_for_human": SERVICE_NAME,
+            "name_for_model": "robo2_signals",
+            "description_for_human": "Sinais, fissuras e dados para oráculos em tempo real com pagamento em USDC e LINK.",
+            "description_for_model": (
+                f"API de sinais e dados para oráculos ({APP_VERSION}). Requer pagamento via protocolo x402 "
+                f"em USDC ou LINK para acessar {base_url}/radar/itens e {base_url}/api/v1/oracle/feed/{{asset}}."
+            ),
+            "auth": {"type": "x402", "assets": ["USDC", "LINK"]},
+            "api": {"type": "openapi", "url": f"{base_url}/openapi.json"},
+            "logo_url": f"{base_url}/static/logo.png",
+            "contact_email": "contato@lentenoir.com",
+            "legal_info_url": base_url,
+        }
+    )
 
 
 # =====================================================================
-# 6. ROTA M2M DE PORTA DUPLA (USDC + LINK VIA COMPROVANTE ON-CHAIN)
+# 7. ROTAS DE DADOS PARA ORÁCULOS & M2M (USDC + LINK)
 # =====================================================================
 @app.get("/api/v1/m2m/feed/{asset}")
-async def get_m2m_feed(
+@app.get("/api/v1/oracle/feed/{asset}")
+async def get_m2m_and_oracle_feed(
+    request: Request,
     asset: str,
     x_payment_tx: str | None = Header(default=None, alias="X-Payment-Tx"),
     x_payment: str | None = Header(default=None, alias="X-PAYMENT"),
 ) -> JSONResponse:
+    base_url = str(request.base_url).rstrip("/") if request.base_url else PUBLIC_BASE_URL
     proof = x_payment_tx or x_payment
 
     if not proof:
-        return JSONResponse(
-            status_code=402,
-            content={
-                "error": "Payment Required",
-                "protocol": "x402",
-                "network": "base-mainnet",
-                "receiver": RECEIVER_WALLET,
-                "solana_recipient": SOLANA_RECIPIENT,
-                "accepted_payments": [
-                    {
-                        "token": "USDC",
-                        "contract": ACCEPTED_TOKENS["USDC"]["address"],
-                        "min_amount": ACCEPTED_TOKENS["USDC"]["min_amount"],
-                    },
-                    {
-                        "token": "LINK",
-                        "contract": ACCEPTED_TOKENS["LINK"]["address"],
-                        "min_amount": ACCEPTED_TOKENS["LINK"]["min_amount"],
-                    },
-                ],
-                "instructions": "Envie USDC ou LINK para receiver e inclua o hash no header X-Payment-Tx.",
-            },
-        )
+        return _payment_required_response(f"/api/v1/oracle/feed/{asset}", base_url)
 
     payment = await asyncio.to_thread(verify_onchain_payment, proof)
     if not payment["valid"]:
@@ -698,6 +760,14 @@ async def get_m2m_feed(
         status_code=200,
         content={
             **signal,
+            "oracle": {
+                "asset": signal["asset"],
+                "price_usd": signal["value"],
+                "bid": signal["bid"],
+                "ask": signal["ask"],
+                "spread_pct": signal["spread_pct"],
+                "updated_at": signal["timestamp"],
+            },
             "settlement": {
                 "paid_with": payment["token"],
                 "amount": payment["amount"],
