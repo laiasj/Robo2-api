@@ -4,10 +4,10 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -19,7 +19,7 @@ SERVICE_NAME = "Robo2 Signals - Monitor Autônomo"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://robo2-api.onrender.com").rstrip("/")
 
 # Cobrança máquina-a-máquina via x402 (USDC na rede Solana)
-SOLANA_PAY_TO = os.getenv("SOLANA_PAY_TO", "COLOQUE_SUA_CARTEIRA_SOLANA_AQUI")
+SOLANA_PAY_TO = os.getenv("SOLANA_PAY_TO", "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk")
 PRICE_USDC = os.getenv("PRICE_USDC", "0.01")
 USDC_SOLANA_MINT = os.getenv(
     "USDC_SOLANA_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -206,7 +206,6 @@ async def run_scan_cycle(force: bool = False) -> Dict[str, Any]:
                         break
                     if r.status_code == 200:
                         text = r.text
-                        # Extração leve de títulos/itens para sinal estruturado
                         snippet = text.strip().replace("\n", " ")[:180]
                         item = {
                             "id": f"{feed['id']}-{int(now * 1000)}",
@@ -245,7 +244,6 @@ async def run_scan_cycle(force: bool = False) -> Dict[str, Any]:
                 "cooldown_sec": RATE_LIMIT_COOLDOWN_SEC,
             }
 
-        # Varredura concluída sem 429
         COOLDOWN_UNTIL_TS = 0.0
         _refresh_rhythm(STATE)
         next_ts = time.time() + BASE_SCAN_INTERVAL_SEC
@@ -428,11 +426,6 @@ async def radar_itens(
     request: Request,
     limit: int = Query(default=25, ge=1, le=100),
 ) -> JSONResponse:
-    """
-    Endpoint protegido por desafio x402:
-    Se o bot/cliente não enviar prova de pagamento no header `X-Payment` / `X-402-Payment`,
-    retorna HTTP 402 com as instruções exatas de pagamento em USDC na Solana.
-    """
     base_url = _base_url_from_request(request)
     payment_proof = (
         request.headers.get("x-payment")
@@ -475,7 +468,6 @@ async def radar_itens(
                 },
             )
 
-        # Pagamento / comprovante recebido: registra operação aprovada e entrega os sinais
         try:
             amount_val = float(PRICE_USDC)
         except ValueError:
@@ -565,64 +557,48 @@ async def api_status() -> JSONResponse:
 # ==============================================================================
 # PAINEL VISUAL WEB (GET / E GET /painel)
 # ==============================================================================
-def _render_dashboard_html(state: Dict[str, Any]) -> str:
-    _refresh_rhythm(state)
-    active_hooks = sum(1 for w in state.get("webhooks", []) if w.get("active"))
-    rows_html = ""
-    for row in state.get("activity_log", [])[:30]:
-        rows_html += (
-            f"<tr>"
-            f"<td>{row.get('time', '--:--:--')}</td>"
-            f"<td><span class='badge'>{row.get('type', '')}</span></td>"
-            f"<td>{row.get('detail', '')}</td>"
-            f"<td>{row.get('value', '-')}</td>"
-            f"</tr>"
-        )
-
-    hourly_json = json.dumps(state.get("hourly_stats", {}), ensure_ascii=False)
-
-    return f"""<!DOCTYPE html>
+_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{SERVICE_NAME} — v{APP_VERSION}</title>
+  <title>__SERVICE_NAME__ — v__APP_VERSION__</title>
   <style>
-    * {{ box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-    body {{ margin: 0; background: #070d19; color: #e6edf7; padding: 20px; }}
-    .wrap {{ max-width: 1180px; margin: 0 auto; }}
-    .top {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }}
-    .title {{ font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 10px; }}
-    .dot {{ width: 10px; height: 10px; border-radius: 50%; background: #10b981; display: inline-block; }}
-    .meta-bar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 13px; }}
-    .pill {{ background: #121c30; border: 1px solid #243452; padding: 6px 12px; border-radius: 8px; }}
-    .btn {{ background: #16a34a; color: #fff; border: 0; padding: 7px 14px; border-radius: 8px; font-weight: 600; cursor: pointer; }}
-    .btn-blue {{ background: #2563eb; color: #fff; border: 0; padding: 8px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; }}
-    .grid-5 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }}
-    .card {{ background: #0d1627; border: 1px solid #1d2b44; border-radius: 12px; padding: 14px; }}
-    .card-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.4px; }}
-    .card-val {{ font-size: 24px; font-weight: 700; margin-top: 6px; }}
-    .green {{ color: #34d399; }}
-    .amber {{ color: #fbbf24; }}
-    .blue {{ color: #60a5fa; }}
-    .card-sub {{ font-size: 12px; color: #94a3b8; margin-top: 4px; }}
-    .section {{ background: #0d1627; border: 1px solid #1d2b44; border-radius: 12px; padding: 16px; margin-bottom: 16px; }}
-    .sec-title {{ font-size: 15px; font-weight: 700; margin-bottom: 12px; display: flex; justify-content: space-between; }}
-    .hook-row {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
-    .inp {{ background: #070d19; border: 1px solid #263859; color: #e6edf7; padding: 8px 12px; border-radius: 8px; min-width: 220px; flex: 1; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ text-align: left; padding: 9px 8px; border-bottom: 1px solid #17243b; }}
-    th {{ color: #94a3b8; font-size: 11px; text-transform: uppercase; }}
-    .badge {{ background: #172554; color: #93c5fd; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { margin: 0; background: #070d19; color: #e6edf7; padding: 20px; }
+    .wrap { max-width: 1180px; margin: 0 auto; }
+    .top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+    .title { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #10b981; display: inline-block; }
+    .meta-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 13px; }
+    .pill { background: #121c30; border: 1px solid #243452; padding: 6px 12px; border-radius: 8px; }
+    .btn { background: #16a34a; color: #fff; border: 0; padding: 7px 14px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+    .btn-blue { background: #2563eb; color: #fff; border: 0; padding: 8px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+    .grid-5 { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .card { background: #0d1627; border: 1px solid #1d2b44; border-radius: 12px; padding: 14px; }
+    .card-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.4px; }
+    .card-val { font-size: 24px; font-weight: 700; margin-top: 6px; }
+    .green { color: #34d399; }
+    .amber { color: #fbbf24; }
+    .blue { color: #60a5fa; }
+    .card-sub { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+    .section { background: #0d1627; border: 1px solid #1d2b44; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .sec-title { font-size: 15px; font-weight: 700; margin-bottom: 12px; display: flex; justify-content: space-between; }
+    .hook-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .inp { background: #070d19; border: 1px solid #263859; color: #e6edf7; padding: 8px 12px; border-radius: 8px; min-width: 220px; flex: 1; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid #17243b; }
+    th { color: #94a3b8; font-size: 11px; text-transform: uppercase; }
+    .badge { background: #172554; color: #93c5fd; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="top">
-      <div class="title"><span class="dot"></span> Robo2 Signals — Monitor Autônomo (v{APP_VERSION})</div>
+      <div class="title"><span class="dot"></span> Robo2 Signals — Monitor Autônomo (v__APP_VERSION__)</div>
       <div class="meta-bar">
-        <span class="pill">Ritmo: <strong>{state.get('rhythm_mode')}</strong></span>
-        <span class="pill">Última varredura: <strong>{state.get('last_scan_at') or '--:--:--'}</strong></span>
+        <span class="pill">Ritmo: <strong>__RHYTHM_MODE__</strong></span>
+        <span class="pill">Última varredura: <strong>__LAST_SCAN_AT__</strong></span>
         <span class="pill">Hora: <strong id="clockNow">--:--:--</strong></span>
         <button class="btn" onclick="scanNow()">Varrer Agora</button>
       </div>
@@ -631,33 +607,33 @@ def _render_dashboard_html(state: Dict[str, Any]) -> str:
     <div class="grid-5">
       <div class="card">
         <div class="card-label">Saldo Phantom (USDC)</div>
-        <div class="card-val green">${state.get('phantom_usdc_balance', 0.0):.2f}</div>
-        <div class="card-sub">Solana • Carteira ativa</div>
+        <div class="card-val green">$__PHANTOM_USDC__</div>
+        <div class="card-sub">Solana • __WALLET_SHORT__</div>
       </div>
       <div class="card">
         <div class="card-label">Operações Aprovadas</div>
-        <div class="card-val green">${state.get('approved_sales_usdc', 0.0):.2f}</div>
-        <div class="card-sub">{state.get('approved_sales_count', 0)} vendas aprovadas</div>
+        <div class="card-val green">$__APPROVED_USDC__</div>
+        <div class="card-sub">__APPROVED_COUNT__ vendas aprovadas</div>
       </div>
       <div class="card">
         <div class="card-label">Cobranças 402</div>
-        <div class="card-val amber">{state.get('x402_charges_count', 0)}</div>
+        <div class="card-val amber">__CHARGES_402__</div>
         <div class="card-sub">Pedidos x402</div>
       </div>
       <div class="card">
         <div class="card-label">Chamadas Totais</div>
-        <div class="card-val blue">{state.get('total_calls', 0)}</div>
-        <div class="card-sub">{state.get('fissures_count', 0)} fissuras • {state.get('hooks_triggered_count', 0)} hooks</div>
+        <div class="card-val blue">__TOTAL_CALLS__</div>
+        <div class="card-sub">__FISSURES_COUNT__ fissuras • __HOOKS_TRIGGERED__ hooks</div>
       </div>
       <div class="card">
         <div class="card-label">Sinais Coletados</div>
-        <div class="card-val blue">{state.get('signals_collected_count', 0)}</div>
+        <div class="card-val blue">__SIGNALS_COLLECTED__</div>
         <div class="card-sub">Economia + Multi-Redes</div>
       </div>
     </div>
 
     <div class="section">
-      <div class="sec-title"><span>Webhook Autônomo de Saída (Agentes / Clientes)</span><span>{active_hooks} ativos</span></div>
+      <div class="sec-title"><span>Webhook Autônomo de Saída (Agentes / Clientes)</span><span>__ACTIVE_HOOKS__ ativos</span></div>
       <div class="hook-row">
         <input id="agentId" class="inp" placeholder="ID do agente/cliente" />
         <input id="webhookUrl" class="inp" placeholder="https://endpoint-do-cliente/webhook" />
@@ -672,45 +648,90 @@ def _render_dashboard_html(state: Dict[str, Any]) -> str:
         <thead>
           <tr><th>Hora</th><th>Status / Tipo</th><th>Operação / Chamada</th><th>Valor</th></tr>
         </thead>
-        <tbody>{rows_html}</tbody>
+        <tbody>__ROWS_HTML__</tbody>
       </table>
     </div>
   </div>
 
   <script>
-    const hourlyData = {hourly_json};
-    function tickClock() {{
+    const hourlyData = __HOURLY_JSON__;
+    function tickClock() {
       const d = new Date();
       document.getElementById("clockNow").textContent = d.toTimeString().slice(0, 8);
       const hk = d.toTimeString().slice(0, 2) + ":00";
-      const b = hourlyData[hk] || {{ charges: 0, signals: 0, approved_usdc: 0 }};
+      const b = hourlyData[hk] || { charges: 0, signals: 0, approved_usdc: 0 };
       document.getElementById("hourlyBadge").textContent =
-        `Hora ${{hk}}: ${{b.charges}} cobranças • ${{b.signals}} sinais • $${Number(b.approved_usdc || 0).toFixed(2)} USDC`;
-    }}
+        `Hora ${hk}: ${b.charges} cobranças • ${b.signals} sinais • $${Number(b.approved_usdc || 0).toFixed(2)} USDC`;
+    }
     setInterval(tickClock, 1000);
     tickClock();
 
-    async function scanNow() {{
-      await fetch("/varrer", {{ method: "POST" }});
+    async function scanNow() {
+      await fetch("/varrer", { method: "POST" });
       location.reload();
-    }}
+    }
 
-    async function activateWebhook() {{
+    async function activateWebhook() {
       const agent_id = document.getElementById("agentId").value.trim();
       const webhook_url = document.getElementById("webhookUrl").value.trim();
       if (!agent_id || !webhook_url) return alert("Preencha o ID do agente e a URL do webhook.");
-      const res = await fetch("/webhooks", {{
+      const res = await fetch("/webhooks", {
         method: "POST",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{ agent_id, webhook_url }})
-      }});
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agent_id, webhook_url })
+      });
       if (res.ok) location.reload();
       else alert("Erro ao ativar webhook.");
-    }}
+    }
   </script>
 </body>
 </html>
 """
+
+
+def _render_dashboard_html(state: Dict[str, Any]) -> str:
+    _refresh_rhythm(state)
+    active_hooks = sum(1 for w in state.get("webhooks", []) if w.get("active"))
+    rows_html = ""
+    for row in state.get("activity_log", [])[:30]:
+        rows_html += (
+            f"<tr>"
+            f"<td>{row.get('time', '--:--:--')}</td>"
+            f"<td><span class='badge'>{row.get('type', '')}</span></td>"
+            f"<td>{row.get('detail', '')}</td>"
+            f"<td>{row.get('value', '-')}</td>"
+            f"</tr>"
+        )
+
+    wallet_short = (
+        f"{SOLANA_PAY_TO[:6]}...{SOLANA_PAY_TO[-4:]}"
+        if len(SOLANA_PAY_TO) > 10
+        else SOLANA_PAY_TO
+    )
+    hourly_json = json.dumps(state.get("hourly_stats", {}), ensure_ascii=False)
+
+    html = _DASHBOARD_TEMPLATE
+    replacements = {
+        "__SERVICE_NAME__": SERVICE_NAME,
+        "__APP_VERSION__": APP_VERSION,
+        "__RHYTHM_MODE__": str(state.get("rhythm_mode", "ATIVO")),
+        "__LAST_SCAN_AT__": str(state.get("last_scan_at") or "--:--:--"),
+        "__PHANTOM_USDC__": f"{float(state.get('phantom_usdc_balance', 0.0)):.2f}",
+        "__WALLET_SHORT__": wallet_short,
+        "__APPROVED_USDC__": f"{float(state.get('approved_sales_usdc', 0.0)):.2f}",
+        "__APPROVED_COUNT__": str(state.get("approved_sales_count", 0)),
+        "__CHARGES_402__": str(state.get("x402_charges_count", 0)),
+        "__TOTAL_CALLS__": str(state.get("total_calls", 0)),
+        "__FISSURES_COUNT__": str(state.get("fissures_count", 0)),
+        "__HOOKS_TRIGGERED__": str(state.get("hooks_triggered_count", 0)),
+        "__SIGNALS_COLLECTED__": str(state.get("signals_collected_count", 0)),
+        "__ACTIVE_HOOKS__": str(active_hooks),
+        "__ROWS_HTML__": rows_html,
+        "__HOURLY_JSON__": hourly_json,
+    }
+    for k, v in replacements.items():
+        html = html.replace(k, v)
+    return html
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
