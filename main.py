@@ -19,7 +19,8 @@ PRECO_USDC = float(os.getenv("PRECO_USDC", "0.01"))
 USDC_MINT_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 INTERVALO_VARREDURA_SEG = int(os.getenv("INTERVALO_VARREDURA_SEG", "180"))  # 3 minutos
-COOLDOWN_WEBHOOK_SEG = int(os.getenv("COOLDOWN_WEBHOOK_SEG", "300"))       # 5 min por código de fissura
+COOLDOWN_WEBHOOK_SEG = int(os.getenv("COOLDOWN_WEBHOOK_SEG", "240"))       # 4 min por código de fissura
+MAX_FALHAS_WEBHOOK = int(os.getenv("MAX_FALHAS_WEBHOOK", "5"))             # Pausa após 5 falhas seguidas
 WEBHOOKS_ARQUIVO = os.getenv("WEBHOOKS_ARQUIVO", "webhooks.json")
 WEBHOOKS_PADRAO = [u.strip() for u in os.getenv("WEBHOOKS_PADRAO", "").split(",") if u.strip()]
 REDE_PAGAMENTO = "solana"
@@ -72,6 +73,8 @@ LOCK_WEBHOOKS = threading.Lock()
 class WebhookCadastro(BaseModel):
     url: str
     gravidades: list[str] = ["critico", "oportunidade"]
+    cliente_id: str | None = None
+    carteira_solana: str | None = None
 
 
 def hora_atual_brt() -> str:
@@ -98,6 +101,11 @@ def carregar_webhooks_disco():
             with open(WEBHOOKS_ARQUIVO, "r", encoding="utf-8") as f:
                 dados = json.load(f)
                 if isinstance(dados, list):
+                    for item in dados:
+                        item.setdefault("ativo", True)
+                        item.setdefault("envios_ok", 0)
+                        item.setdefault("falhas_seguidas", 0)
+                        item.setdefault("ultimo_envio_brt", None)
                     lista = dados
         except Exception:
             lista = []
@@ -108,6 +116,12 @@ def carregar_webhooks_disco():
             lista.append({
                 "url": u,
                 "gravidades": ["critico", "oportunidade"],
+                "cliente_id": "agente_padrao",
+                "carteira_solana": None,
+                "ativo": True,
+                "envios_ok": 0,
+                "falhas_seguidas": 0,
+                "ultimo_envio_brt": None,
                 "criado_em": hora_atual_brt()
             })
             urls_existentes.add(u)
@@ -140,36 +154,64 @@ def registrar_evento(tipo: str, detalhe: str, valor_usdc: float = 0.0, status: s
     })
 
 
-def _enviar_webhook_individual(url_hook: str, codigo: str, payload_bytes: bytes):
-    try:
-        req = urllib.request.Request(
-            url_hook,
-            data=payload_bytes,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Robo2-Webhook-Dispatcher/2.6"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            METRICAS["total_webhooks_enviados"] += 1
-            registrar_evento(
-                "WEBHOOK ENVIADO",
-                f"[{codigo}] -> {url_hook} (HTTP {resp.status})",
-                0.0,
-                "chamada"
+def _enviar_webhook_com_retentativa(hook: dict, codigo: str, payload_bytes: bytes):
+    """Envia POST para o assinante com 1 retentativa automática e controle de saúde."""
+    url_hook = hook["url"]
+    cliente_rotulo = hook.get("cliente_id") or "agente"
+    ultimo_erro = ""
+
+    for tentativa in range(2):
+        try:
+            req = urllib.request.Request(
+                url_hook,
+                data=payload_bytes,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Robo2-Cliente": cliente_rotulo,
+                    "X-Robo2-Evento": codigo,
+                    "User-Agent": "Robo2-Autonomous-Webhook/2.8"
+                }
             )
-    except Exception as e:
-        registrar_evento(
-            "WEBHOOK FALHOU",
-            f"[{codigo}] -> {url_hook}: {str(e)[:60]}",
-            0.0,
-            "erro"
-        )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                with LOCK_WEBHOOKS:
+                    hook["envios_ok"] = hook.get("envios_ok", 0) + 1
+                    hook["falhas_seguidas"] = 0
+                    hook["ativo"] = True
+                    hook["ultimo_envio_brt"] = hora_atual_brt()
+                salvar_webhooks_disco()
+                METRICAS["total_webhooks_enviados"] += 1
+                registrar_evento(
+                    "WEBHOOK ENVIADO",
+                    f"[{cliente_rotulo} • {codigo}] -> {url_hook} (HTTP {resp.status})",
+                    0.0,
+                    "chamada"
+                )
+                return
+        except Exception as e:
+            ultimo_erro = str(e)[:60]
+            if tentativa == 0:
+                time.sleep(1.5)
+
+    pausado_agora = False
+    with LOCK_WEBHOOKS:
+        hook["falhas_seguidas"] = hook.get("falhas_seguidas", 0) + 1
+        if hook["falhas_seguidas"] >= MAX_FALHAS_WEBHOOK:
+            hook["ativo"] = False
+            pausado_agora = True
+    salvar_webhooks_disco()
+
+    aviso_pausa = " • Assinante pausado após falhas seguidas" if pausado_agora else ""
+    registrar_evento(
+        "WEBHOOK FALHOU",
+        f"[{cliente_rotulo} • {codigo}] -> {url_hook}: {ultimo_erro}{aviso_pausa}",
+        0.0,
+        "erro"
+    )
 
 
 def despachar_webhooks_fissura(evento_fissura: dict):
-    """Dispara webhooks em threads paralelas sem bloquear o loop principal."""
+    """Dispara webhooks autônomos em threads paralelas sem bloquear o robô."""
     gravidade = evento_fissura.get("gravidade", "")
     codigo = evento_fissura.get("codigo", "")
 
@@ -184,7 +226,7 @@ def despachar_webhooks_fissura(evento_fissura: dict):
     with LOCK_WEBHOOKS:
         alvos_hook = [
             w for w in ESTADO_VIGILANCIA["webhooks_inscritos"]
-            if "todas" in w.get("gravidades", []) or gravidade in w.get("gravidades", [])
+            if w.get("ativo", True) and ("todas" in w.get("gravidades", []) or gravidade in w.get("gravidades", []))
         ]
 
     if not alvos_hook:
@@ -193,16 +235,24 @@ def despachar_webhooks_fissura(evento_fissura: dict):
     ESTADO_VIGILANCIA["ultimo_envio_por_codigo"][codigo] = agora
     payload_bytes = json.dumps({
         "servico": "Robo2 Signals API",
-        "versao": "2.6.0",
+        "versao": "2.8.0",
+        "tipo_mensagem": "alerta_fissura_autonomo",
         "emitido_em": datetime.now(BRT).isoformat(),
-        "pagamento": {"moeda": MOEDA_PAGAMENTO, "rede": REDE_PAGAMENTO, "preco_usdc": PRECO_USDC},
+        "pagamento_x402": {
+            "endpoint_completo": "/radar/itens",
+            "protocolo": "x402",
+            "moeda": MOEDA_PAGAMENTO,
+            "rede": REDE_PAGAMENTO,
+            "preco_usdc": PRECO_USDC,
+            "payTo": PAY_TO_ADDRESS
+        },
         "evento": evento_fissura
     }).encode("utf-8")
 
     for hook in alvos_hook:
         t = threading.Thread(
-            target=_enviar_webhook_individual,
-            args=(hook["url"], codigo, payload_bytes),
+            target=_enviar_webhook_com_retentativa,
+            args=(hook, codigo, payload_bytes),
             daemon=True
         )
         t.start()
@@ -288,7 +338,7 @@ def validar_pagamento_solana_usdc(assinatura_tx: str) -> tuple[bool, str]:
 
 def extrair_defillama(limite: int = 10):
     url_llama = f"https://coins.llama.fi/prices/current/{COINS_DEFILLAMA}"
-    req = urllib.request.Request(url_llama, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.6)"})
+    req = urllib.request.Request(url_llama, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.8)"})
     with urllib.request.urlopen(req, timeout=8) as resp:
         coins = json.loads(resp.read().decode("utf-8")).get("coins", {})
 
@@ -315,7 +365,7 @@ def extrair_dexscreener(limite: int = 10):
     itens = []
     for termo in QUERIES_DEXSCREENER:
         url_dex = f"https://api.dexscreener.com/latest/dex/search?q={termo}"
-        req = urllib.request.Request(url_dex, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.6)"})
+        req = urllib.request.Request(url_dex, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.8)"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             pares = json.loads(resp.read().decode("utf-8")).get("pairs", [])[:2]
 
@@ -342,7 +392,7 @@ def extrair_itens_feed(url: str, limite: int = 5):
     if url == "descentralizado://dexscreener":
         return extrair_dexscreener(limite=max(limite, 8))
 
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.6)", "Accept": "*/*"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.8)", "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=8) as resp:
         raw = resp.read().decode("utf-8", errors="ignore")
 
@@ -528,8 +578,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Robo2 Signals API",
-    description="API proativa de sinais estruturados em tempo real (Economia, Tech e Redes Descentralizadas) via x402 em USDC (Solana) com Webhooks.",
-    version="2.6.0",
+    description="API proativa de sinais estruturados em tempo real (Economia, Tech e Redes Descentralizadas) via x402 em USDC (Solana) com Webhooks Autônomos.",
+    version="2.8.0",
     lifespan=lifespan
 )
 
@@ -568,8 +618,8 @@ def root():
     return {
         "status": "online",
         "servico": "Robo2 Signals API",
-        "versao": "2.6.0",
-        "modo": "proativo_descentralizado_webhooks",
+        "versao": "2.8.0",
+        "modo": "proativo_webhook_autonomo",
         "ultima_varredura": ESTADO_VIGILANCIA["ultima_varredura_brt"],
         "moeda": MOEDA_PAGAMENTO,
         "rede": REDE_PAGAMENTO,
@@ -582,7 +632,9 @@ def root():
             "fissuras": "/api/fissuras",
             "forcar_varredura": "/api/varrer-agora",
             "webhooks": "/webhooks",
+            "registrar_webhook": "/webhooks/registrar",
             "x402": "/.well-known/x402",
+            "agente": "/.well-known/agent.json",
             "openapi": "/openapi.json"
         }
     }
@@ -594,6 +646,7 @@ def listar_webhooks():
     return {
         "total": len(ESTADO_VIGILANCIA["webhooks_inscritos"]),
         "cooldown_seg": COOLDOWN_WEBHOOK_SEG,
+        "max_falhas_antes_pausa": MAX_FALHAS_WEBHOOK,
         "webhooks": ESTADO_VIGILANCIA["webhooks_inscritos"]
     }
 
@@ -604,24 +657,63 @@ def registrar_webhook(dados: WebhookCadastro):
     if not (url_limpa.startswith("https://") or url_limpa.startswith("http://")):
         return JSONResponse(status_code=400, content={"erro": "URL de webhook inválida. Use http:// ou https://"})
 
+    cliente_id = (dados.cliente_id or "").strip() or f"agente_{abs(hash(url_limpa)) % 10000}"
+    carteira = (dados.carteira_solana or "").strip() or None
+    acao = "cadastrado"
+
     with LOCK_WEBHOOKS:
+        alvo_hook = None
         for w in ESTADO_VIGILANCIA["webhooks_inscritos"]:
             if w["url"] == url_limpa:
                 w["gravidades"] = dados.gravidades
-                salvar_webhooks_disco()
-                registrar_evento("WEBHOOK ATUALIZADO", url_limpa, 0.0, "chamada")
-                return {"status": "atualizado", "webhook": w}
+                w["cliente_id"] = cliente_id
+                w["carteira_solana"] = carteira
+                w["ativo"] = True
+                w["falhas_seguidas"] = 0
+                alvo_hook = w
+                acao = "atualizado"
+                break
 
-        novo = {
-            "url": url_limpa,
-            "gravidades": dados.gravidades,
-            "criado_em": hora_atual_brt()
-        }
-        ESTADO_VIGILANCIA["webhooks_inscritos"].append(novo)
-        salvar_webhooks_disco()
+        if alvo_hook is None:
+            alvo_hook = {
+                "url": url_limpa,
+                "gravidades": dados.gravidades,
+                "cliente_id": cliente_id,
+                "carteira_solana": carteira,
+                "ativo": True,
+                "envios_ok": 0,
+                "falhas_seguidas": 0,
+                "ultimo_envio_brt": None,
+                "criado_em": hora_atual_brt()
+            }
+            ESTADO_VIGILANCIA["webhooks_inscritos"].append(alvo_hook)
 
-    registrar_evento("WEBHOOK CADASTRADO", url_limpa, 0.0, "chamada")
-    return {"status": "cadastrado", "webhook": novo}
+    salvar_webhooks_disco()
+    registrar_evento(f"WEBHOOK {acao.upper()}", f"[{cliente_id}] {url_limpa}", 0.0, "chamada")
+
+    # Envio imediato de boas-vindas em thread separada para confirmar entrega ao assinante
+    boas_vindas = json.dumps({
+        "servico": "Robo2 Signals API",
+        "versao": "2.8.0",
+        "tipo_mensagem": "assinatura_confirmada",
+        "emitido_em": datetime.now(BRT).isoformat(),
+        "pagamento_x402": {
+            "endpoint_completo": "/radar/itens",
+            "protocolo": "x402",
+            "moeda": MOEDA_PAGAMENTO,
+            "rede": REDE_PAGAMENTO,
+            "preco_usdc": PRECO_USDC,
+            "payTo": PAY_TO_ADDRESS
+        },
+        "ultima_fissura": ESTADO_VIGILANCIA["fissuras_ativas"][0] if ESTADO_VIGILANCIA["fissuras_ativas"] else None
+    }).encode("utf-8")
+    threading.Thread(
+        target=_enviar_webhook_com_retentativa,
+        args=(alvo_hook, "ASSINATURA_ATIVA", boas_vindas),
+        daemon=True
+    ).start()
+
+    return {"status": acao, "webhook": alvo_hook}
 
 
 @app.delete("/webhooks")
@@ -632,7 +724,7 @@ def remover_webhook(url: str = Query(...)):
             w for w in ESTADO_VIGILANCIA["webhooks_inscritos"] if w["url"] != url.strip()
         ]
         removidos = antes - len(ESTADO_VIGILANCIA["webhooks_inscritos"])
-        salvar_webhooks_disco()
+    salvar_webhooks_disco()
     registrar_evento("WEBHOOK REMOVIDO", f"{url} ({removidos})", 0.0, "chamada")
     return {"removidos": removidos}
 
@@ -660,6 +752,8 @@ def listar_fissuras(executar_agora: bool = Query(default=False)):
 def obter_metricas():
     carteira = consultar_saldo_solana_usdc()
     horas_ordenadas = sorted(METRICAS["historico_horas"].values(), key=lambda x: x["hora"])[-8:]
+    with LOCK_WEBHOOKS:
+        lista_hooks = list(ESTADO_VIGILANCIA["webhooks_inscritos"])
     return {
         "hora_agora": hora_atual_brt(),
         "iniciado_em": METRICAS["iniciado_em_brt"],
@@ -672,7 +766,8 @@ def obter_metricas():
         "itens_entregues": METRICAS["total_itens_entregues"],
         "total_chamadas": METRICAS["total_chamadas"],
         "total_webhooks_enviados": METRICAS["total_webhooks_enviados"],
-        "webhooks_ativos": len(ESTADO_VIGILANCIA["webhooks_inscritos"]),
+        "webhooks_ativos": sum(1 for w in lista_hooks if w.get("ativo", True)),
+        "webhooks_lista": lista_hooks,
         "fissuras_ativas": len(ESTADO_VIGILANCIA["fissuras_ativas"]),
         "grafico_horas": horas_ordenadas,
         "eventos": list(METRICAS["eventos"])
@@ -723,10 +818,14 @@ def dashboard_visual():
     .b-entrada { background: #3fb950; }
     .hora-lbl { font-size: 0.72rem; color: #8b949e; margin-top: 6px; }
     .hook-form { display: flex; gap: 8px; flex-wrap: wrap; width: 100%; }
-    .hook-input { flex: 1; min-width: 220px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 8px; padding: 8px 11px; font-size: 0.83rem; }
+    .hook-input { flex: 1; min-width: 200px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 8px; padding: 8px 11px; font-size: 0.83rem; }
+    .hook-input.curto { flex: 0 1 180px; min-width: 140px; }
     .btn-hook { background: #1f6feb; color: #fff; border: none; padding: 8px 14px; border-radius: 8px; font-size: 0.82rem; font-weight: 600; cursor: pointer; }
     .btn-hook:hover { background: #388bfd; }
     .hook-msg { font-size: 0.76rem; color: #8b949e; margin-top: 8px; }
+    .hook-lista { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+    .hook-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 7px 10px; font-size: 0.78rem; }
+    .btn-rem { background: transparent; color: #f85149; border: 1px solid rgba(248,81,73,0.35); padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; cursor: pointer; }
     .filtros { display: flex; gap: 6px; flex-wrap: wrap; }
     .filtro-btn { background: #0d1117; color: #8b949e; border: 1px solid #30363d; padding: 4px 10px; border-radius: 999px; font-size: 0.74rem; cursor: pointer; }
     .filtro-btn.ativo { background: #1f6feb; color: #fff; border-color: #1f6feb; }
@@ -744,7 +843,7 @@ def dashboard_visual():
 <body>
   <div class="wrap">
     <div class="top">
-      <div class="titulo"><span class="ponto"></span> Robo2 Signals — Monitor Proativo</div>
+      <div class="titulo"><span class="ponto"></span> Robo2 Signals — Monitor Autônomo</div>
       <div class="acoes-topo">
         <div class="hora-box" id="varredura-topo">Varredura: --:--:--</div>
         <div class="hora-box" id="hora-topo">Hora: --:--:--</div>
@@ -796,14 +895,16 @@ def dashboard_visual():
 
     <div class="caixa">
       <div class="caixa-topo">
-        <h2>Webhook de Saída (Agentes / Clientes)</h2>
-        <span class="sub" id="hooks-ativos-lbl">0 cadastrados</span>
+        <h2>Webhook Autônomo de Saída (Agentes / Clientes)</h2>
+        <span class="sub" id="hooks-ativos-lbl">0 ativos</span>
       </div>
       <div class="hook-form">
-        <input class="hook-input" id="hook-url" type="url" placeholder="https://seu-agente.exemplo/webhook" />
-        <button class="btn-hook" onclick="cadastrarWebhook()">Salvar Webhook</button>
+        <input class="hook-input curto" id="hook-cliente" type="text" placeholder="ID do agente/cliente" />
+        <input class="hook-input" id="hook-url" type="url" placeholder="https://endpoint-do-cliente/webhook" />
+        <button class="btn-hook" onclick="cadastrarWebhook()">Ativar Webhook</button>
       </div>
-      <div class="hook-msg" id="hook-msg">Dispara automaticamente quando há fissura crítica ou oportunidade de sinal/arbitragem.</div>
+      <div class="hook-msg" id="hook-msg">Envia automaticamente o alerta e o caminho de pagamento x402 quando surge fissura crítica ou oportunidade.</div>
+      <div class="hook-lista" id="hook-lista"></div>
     </div>
 
     <div class="caixa">
@@ -882,23 +983,26 @@ def dashboard_visual():
     }
 
     async function cadastrarWebhook() {
-      const inp = document.getElementById('hook-url');
+      const inpUrl = document.getElementById('hook-url');
+      const inpCli = document.getElementById('hook-cliente');
       const msg = document.getElementById('hook-msg');
-      const url = inp.value.trim();
+      const url = inpUrl.value.trim();
+      const cliente_id = inpCli.value.trim() || null;
       if (!url) {
-        msg.textContent = 'Cole uma URL http:// ou https:// antes de salvar.';
+        msg.textContent = 'Informe uma URL http:// ou https:// do agente/cliente.';
         return;
       }
       try {
         const r = await fetch('/webhooks/registrar', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, gravidades: ['critico', 'oportunidade'] })
+          body: JSON.stringify({ url, cliente_id, gravidades: ['critico', 'oportunidade'] })
         });
         const j = await r.json();
         if (r.ok) {
-          msg.textContent = 'Webhook salvo (' + j.status + '): ' + url;
-          inp.value = '';
+          msg.textContent = 'Webhook ativo (' + j.status + ') para ' + (j.webhook.cliente_id || '') + ': ' + url;
+          inpUrl.value = '';
+          inpCli.value = '';
           await carregar();
         } else {
           msg.textContent = 'Erro: ' + (j.erro || 'URL inválida');
@@ -906,6 +1010,11 @@ def dashboard_visual():
       } catch (e) {
         msg.textContent = 'Falha ao salvar webhook.';
       }
+    }
+
+    async function removerWebhook(url) {
+      await fetch('/webhooks?url=' + encodeURIComponent(url), { method: 'DELETE' });
+      await carregar();
     }
 
     async function forcarVarredura() {
@@ -934,9 +1043,19 @@ def dashboard_visual():
         document.getElementById('cobrancas').textContent = d.cobrancas_402;
         document.getElementById('chamadas').textContent = d.total_chamadas || 0;
         document.getElementById('fissuras-sub').textContent = (d.fissuras_ativas || 0) + ' fissuras • ' + (d.total_webhooks_enviados || 0) + ' hooks';
-        document.getElementById('hooks-ativos-lbl').textContent = (d.webhooks_ativos || 0) + ' cadastrados';
+        document.getElementById('hooks-ativos-lbl').textContent = (d.webhooks_ativos || 0) + ' ativos';
         document.getElementById('saidas').textContent = d.itens_entregues;
         document.getElementById('status-sync').textContent = 'Sincronizado às ' + d.hora_agora;
+
+        const hl = document.getElementById('hook-lista');
+        const hooks = d.webhooks_lista || [];
+        hl.innerHTML = hooks.map(h => {
+          const st = h.ativo !== false ? '<span style="color:#3fb950">● ativo</span>' : '<span style="color:#f85149">● pausado</span>';
+          return `<div class="hook-item">
+            <div>${st} <strong>${h.cliente_id || 'agente'}</strong> • ${h.url} <span style="color:#8b949e">(${h.envios_ok || 0} envios)</span></div>
+            <button class="btn-rem" onclick="removerWebhook('${h.url}')">Remover</button>
+          </div>`;
+        }).join('');
 
         const g = document.getElementById('grafico');
         if (d.grafico_horas && d.grafico_horas.length > 0) {
@@ -980,13 +1099,42 @@ def well_known_x402(request: Request):
         "network": REDE_PAGAMENTO,
         "currency": MOEDA_PAGAMENTO,
         "payTo": PAY_TO_ADDRESS,
-        "endpoints": [{
-            "path": "/radar/itens",
-            "method": "GET",
-            "priceUSDC": f"{PRECO_USDC:.2f}",
-            "description": "Manchetes Economia/Tech + Cotações CEX/DEX Multi-Redes + Fissuras."
-        }],
+        "endpoints": [
+            {
+                "path": "/radar/itens",
+                "method": "GET",
+                "priceUSDC": f"{PRECO_USDC:.2f}",
+                "description": "Manchetes Economia/Tech + Cotações CEX/DEX Multi-Redes + Fissuras."
+            },
+            {
+                "path": "/webhooks/registrar",
+                "method": "POST",
+                "priceUSDC": "0.00",
+                "description": "Assina notificações push autônomas de fissuras críticas e oportunidades."
+            }
+        ],
         "openapi": f"{base}/openapi.json"
+    }
+
+
+@app.get("/.well-known/agent.json")
+def well_known_agent(request: Request):
+    registrar_evento("CHAMADA /.well-known/agent.json", "Descoberta de agente autônomo", 0.0, "chamada")
+    base = str(request.base_url).rstrip("/")
+    return {
+        "name": "Robo2 Signals API",
+        "version": "2.8.0",
+        "autonomous_scanning": True,
+        "autonomous_webhooks": True,
+        "payment": {"protocol": "x402", "network": REDE_PAGAMENTO, "currency": MOEDA_PAGAMENTO, "payTo": PAY_TO_ADDRESS, "priceUSDC": PRECO_USDC},
+        "capabilities": ["macro_tech_news", "multichain_dex_prices", "fissure_detection", "autonomous_push_webhooks"],
+        "endpoints": {
+            "signals_paid": f"{base}/radar/itens",
+            "fissures": f"{base}/api/fissuras",
+            "webhook_subscribe": f"{base}/webhooks/registrar",
+            "webhooks_list": f"{base}/webhooks",
+            "openapi": f"{base}/openapi.json"
+        }
     }
 
 
@@ -998,8 +1146,8 @@ def well_known_ai_plugin(request: Request):
         "schema_version": "v1",
         "name_for_human": "Robo2 Signals API",
         "name_for_model": "robo2_signals",
-        "description_for_human": "Sinais de Economia, Tech e Redes Descentralizadas via x402 USDC.",
-        "description_for_model": "Fetches structured economy, tech, decentralized crypto markets, and anomaly signals via GET /radar/itens with x402 USDC payment on Solana.",
+        "description_for_human": "Sinais de Economia, Tech e Redes Descentralizadas via x402 USDC com Webhooks Autônomos.",
+        "description_for_model": "Fetches structured economy, tech, decentralized crypto markets, and anomaly signals via GET /radar/itens with x402 USDC payment on Solana, and subscribes autonomous agents via POST /webhooks/registrar.",
         "auth": {"type": "none"},
         "api": {"type": "openapi", "url": f"{base}/openapi.json"}
     }
@@ -1020,7 +1168,7 @@ def verificar_radar():
             })
             continue
         try:
-            req = urllib.request.Request(alvo["url"], headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.6)"})
+            req = urllib.request.Request(alvo["url"], headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.8)"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 conteudo = resp.read()
                 total_kb += max(1, len(conteudo) // 1024)
