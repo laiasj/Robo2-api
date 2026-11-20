@@ -1,1323 +1,720 @@
-from fastapi import FastAPI, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
-from pydantic import BaseModel
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
-from collections import deque
 import asyncio
-import threading
+import json
 import os
 import time
-import base64
-import urllib.request
-import xml.etree.ElementTree as ET
-import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-PAY_TO_ADDRESS = os.getenv("PAY_TO_ADDRESS", "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk")
-PRECO_USDC = float(os.getenv("PRECO_USDC", "0.01"))
-USDC_MINT_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-INTERVALO_BASE_SEG = int(os.getenv("INTERVALO_BASE_SEG", "240"))        # 4 min base adaptativa
-INTERVALO_MIN_SEG = int(os.getenv("INTERVALO_MIN_SEG", "90"))           # 1.5 min em momento quente
-INTERVALO_MAX_SEG = int(os.getenv("INTERVALO_MAX_SEG", "600"))          # 10 min em momento calmo
-COOLDOWN_WEBHOOK_SEG = int(os.getenv("COOLDOWN_WEBHOOK_SEG", "240"))     # 4 min por código de fissura
-MAX_FALHAS_WEBHOOK = int(os.getenv("MAX_FALHAS_WEBHOOK", "5"))           # Pausa após 5 falhas seguidas
-WEBHOOKS_ARQUIVO = os.getenv("WEBHOOKS_ARQUIVO", "webhooks.json")
-WEBHOOKS_PADRAO = [u.strip() for u in os.getenv("WEBHOOKS_PADRAO", "").split(",") if u.strip()]
-REDE_PAGAMENTO = "solana"
-MOEDA_PAGAMENTO = "USDC"
-BRT = timezone(timedelta(hours=-3))
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 
-TARGETS = [
-    {"id": "tech_theverge", "categoria": "tecnologia", "fonte": "The Verge", "url": "https://www.theverge.com/rss/index.xml"},
-    {"id": "tech_techcrunch", "categoria": "tecnologia", "fonte": "TechCrunch", "url": "https://techcrunch.com/feed/"},
-    {"id": "econ_cnbc", "categoria": "economia", "fonte": "CNBC Top News", "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"},
-    {"id": "crypto_btc_usd", "categoria": "economia", "fonte": "Coinbase Spot BTC-USD", "url": "https://api.coinbase.com/v2/prices/BTC-USD/spot"},
-    {"id": "defillama_lote", "categoria": "cripto", "fonte": "DefiLlama Multi-Redes", "url": "descentralizado://defillama"},
-    {"id": "dexscreener_redes", "categoria": "cripto", "fonte": "DexScreener DEX Pulse", "url": "descentralizado://dexscreener"}
+# ==============================================================================
+# CONFIGURAÇÃO GERAL - ROBO2 SIGNALS (v2.10.0)
+# ==============================================================================
+APP_VERSION = "2.10.0"
+SERVICE_NAME = "Robo2 Signals - Monitor Autônomo"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://robo2-api.onrender.com").rstrip("/")
+
+# Cobrança máquina-a-máquina via x402 (USDC na rede Solana)
+SOLANA_PAY_TO = os.getenv("SOLANA_PAY_TO", "COLOQUE_SUA_CARTEIRA_SOLANA_AQUI")
+PRICE_USDC = os.getenv("PRICE_USDC", "0.01")
+USDC_SOLANA_MINT = os.getenv(
+    "USDC_SOLANA_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+)
+
+# Ritmo adaptativo e proteção contra erro 429
+BASE_SCAN_INTERVAL_SEC = int(os.getenv("BASE_SCAN_INTERVAL_SEC", "60"))
+RATE_LIMIT_COOLDOWN_SEC = int(os.getenv("RATE_LIMIT_COOLDOWN_SEC", "360"))
+AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
+
+# Persistência em disco (se houver disco no Render em /var/data, usa lá; senão usa ./data)
+DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data" if Path("/var/data").exists() else "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = DATA_DIR / "robo2_state_v210.json"
+
+# Fontes configuradas para varredura
+FEEDS = [
+    {"id": "econ_cnbc", "name": "CNBC Markets", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
+    {"id": "econ_reuters", "name": "Reuters Business", "url": "https://feeds.reuters.com/reuters/businessNews"},
+    {"id": "crypto_coindesk", "name": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+    {"id": "dex_trending", "name": "DexScreener Pairs", "url": "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112"},
+    {"id": "macro_fed", "name": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories"},
+    {"id": "tech_status", "name": "Tech & Infrastructure", "url": "https://feeds.arstechnica.com/arstechnica/index"},
 ]
 
-COINS_DEFILLAMA = (
-    "coingecko:bitcoin,coingecko:ethereum,coingecko:solana,coingecko:usd-coin,"
-    "coingecko:arbitrum,coingecko:sui,coingecko:avalanche-2,coingecko:chainlink"
-)
-QUERIES_DEXSCREENER = ["solana", "ethereum"]
-PALAVRAS_CHAVE_SINAL = ["sec", "etf", "fed", "hack", "outage", "solana", "bitcoin", "openai", "crash", "rate", "inflation"]
+app = FastAPI(title=SERVICE_NAME, version=APP_VERSION)
 
-METRICAS = {
-    "iniciado_em_brt": datetime.now(BRT).strftime("%d/%m %H:%M:%S"),
-    "total_cobrancas_402": 0,
-    "total_vendas_pagas": 0,
-    "receita_sessao_usdc": 0.0,
-    "total_itens_entregues": 0,
-    "total_chamadas": 0,
-    "total_webhooks_enviados": 0,
-    "historico_horas": {},
-    "eventos": deque(maxlen=120)
-}
 
-ESTADO_VIGILANCIA = {
-    "ultima_varredura_brt": "Ainda não executada",
-    "proximo_intervalo_seg": INTERVALO_BASE_SEG,
-    "estrategia_ritmo": "EQUILIBRADO",
-    "ultimo_btc_coinbase": None,
-    "ultimo_btc_llama": None,
-    "falhas_consecutivas_fonte": {t["id"]: 0 for t in TARGETS},
-    "fonte_pausada_ate": {t["id"]: 0.0 for t in TARGETS},
-    "rpc_pausado_ate": 0.0,
-    "ultimos_titulos_vistos": deque(maxlen=80),
-    "fissuras_ativas": deque(maxlen=40),
-    "cache_coleta": {},
-    "webhooks_inscritos": [],
-    "ultimo_envio_por_codigo": {}
-}
+# ==============================================================================
+# MODELOS DE ENTRADA
+# ==============================================================================
+class WebhookCreateRequest(BaseModel):
+    agent_id: str = Field(..., min_length=1, max_length=120)
+    webhook_url: str = Field(..., min_length=8, max_length=500)
 
-LOCK_WEBHOOKS = threading.Lock()
 
-
-class WebhookCadastro(BaseModel):
-    url: str
-    gravidades: list[str] = ["critico", "oportunidade"]
-    cliente_id: str | None = None
-    carteira_solana: str | None = None
-
-
-def hora_atual_brt() -> str:
-    return datetime.now(BRT).strftime("%H:%M:%S")
-
-
-def faixa_hora_brt() -> str:
-    return datetime.now(BRT).strftime("%H:00")
-
-
-def salvar_webhooks_disco():
-    with LOCK_WEBHOOKS:
-        try:
-            with open(WEBHOOKS_ARQUIVO, "w", encoding="utf-8") as f:
-                json.dump(ESTADO_VIGILANCIA["webhooks_inscritos"], f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-
-def carregar_webhooks_disco():
-    lista = []
-    if os.path.exists(WEBHOOKS_ARQUIVO):
-        try:
-            with open(WEBHOOKS_ARQUIVO, "r", encoding="utf-8") as f:
-                dados = json.load(f)
-                if isinstance(dados, list):
-                    for item in dados:
-                        item.setdefault("ativo", True)
-                        item.setdefault("envios_ok", 0)
-                        item.setdefault("falhas_seguidas", 0)
-                        item.setdefault("ultimo_envio_brt", None)
-                    lista = dados
-        except Exception:
-            lista = []
-
-    urls_existentes = {w.get("url") for w in lista}
-    for u in WEBHOOKS_PADRAO:
-        if u not in urls_existentes:
-            lista.append({
-                "url": u,
-                "gravidades": ["critico", "oportunidade"],
-                "cliente_id": "agente_padrao",
-                "carteira_solana": None,
-                "ativo": True,
-                "envios_ok": 0,
-                "falhas_seguidas": 0,
-                "ultimo_envio_brt": None,
-                "criado_em": hora_atual_brt()
-            })
-            urls_existentes.add(u)
-
-    ESTADO_VIGILANCIA["webhooks_inscritos"] = lista
-
-
-def registrar_evento(tipo: str, detalhe: str, valor_usdc: float = 0.0, status: str = "chamada"):
-    faixa = faixa_hora_brt()
-    if faixa not in METRICAS["historico_horas"]:
-        METRICAS["historico_horas"][faixa] = {"hora": faixa, "entradas_usdc": 0.0, "cobrancas": 0, "saidas_itens": 0}
-
-    METRICAS["total_chamadas"] += 1
-
-    if status in ("aprovada", "entrada"):
-        METRICAS["historico_horas"][faixa]["entradas_usdc"] = round(
-            METRICAS["historico_horas"][faixa]["entradas_usdc"] + valor_usdc, 4
-        )
-    elif status == "402":
-        METRICAS["historico_horas"][faixa]["cobrancas"] += 1
-    elif status == "saida":
-        METRICAS["historico_horas"][faixa]["saidas_itens"] += int(valor_usdc)
-
-    METRICAS["eventos"].appendleft({
-        "hora": hora_atual_brt(),
-        "tipo": tipo,
-        "detalhe": detalhe,
-        "valor_usdc": valor_usdc,
-        "status": status
-    })
-
-
-def _enviar_webhook_com_retentativa(hook: dict, codigo: str, payload_bytes: bytes):
-    url_hook = hook["url"]
-    cliente_rotulo = hook.get("cliente_id") or "agente"
-    ultimo_erro = ""
-
-    for tentativa in range(2):
-        try:
-            req = urllib.request.Request(
-                url_hook,
-                data=payload_bytes,
-                method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Robo2-Cliente": cliente_rotulo,
-                    "X-Robo2-Evento": codigo,
-                    "User-Agent": "Robo2-Autonomous-Webhook/2.9"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                with LOCK_WEBHOOKS:
-                    hook["envios_ok"] = hook.get("envios_ok", 0) + 1
-                    hook["falhas_seguidas"] = 0
-                    hook["ativo"] = True
-                    hook["ultimo_envio_brt"] = hora_atual_brt()
-                salvar_webhooks_disco()
-                METRICAS["total_webhooks_enviados"] += 1
-                registrar_evento(
-                    "WEBHOOK ENVIADO",
-                    f"[{cliente_rotulo} • {codigo}] -> {url_hook} (HTTP {resp.status})",
-                    0.0,
-                    "chamada"
-                )
-                return
-        except Exception as e:
-            ultimo_erro = str(e)[:60]
-            if tentativa == 0:
-                time.sleep(1.5)
-
-    pausado_agora = False
-    with LOCK_WEBHOOKS:
-        hook["falhas_seguidas"] = hook.get("falhas_seguidas", 0) + 1
-        if hook["falhas_seguidas"] >= MAX_FALHAS_WEBHOOK:
-            hook["ativo"] = False
-            pausado_agora = True
-    salvar_webhooks_disco()
-
-    aviso_pausa = " • Assinante pausado após falhas seguidas" if pausado_agora else ""
-    registrar_evento(
-        "WEBHOOK FALHOU",
-        f"[{cliente_rotulo} • {codigo}] -> {url_hook}: {ultimo_erro}{aviso_pausa}",
-        0.0,
-        "erro"
-    )
-
-
-def despachar_webhooks_fissura(evento_fissura: dict):
-    gravidade = evento_fissura.get("gravidade", "")
-    codigo = evento_fissura.get("codigo", "")
-
-    if gravidade not in ("critico", "oportunidade"):
-        return
-
-    agora = time.time()
-    ultimo_ts = ESTADO_VIGILANCIA["ultimo_envio_por_codigo"].get(codigo, 0)
-    if agora - ultimo_ts < COOLDOWN_WEBHOOK_SEG:
-        return
-
-    with LOCK_WEBHOOKS:
-        alvos_hook = [
-            w for w in ESTADO_VIGILANCIA["webhooks_inscritos"]
-            if w.get("ativo", True) and ("todas" in w.get("gravidades", []) or gravidade in w.get("gravidades", []))
-        ]
-
-    if not alvos_hook:
-        return
-
-    ESTADO_VIGILANCIA["ultimo_envio_por_codigo"][codigo] = agora
-    payload_bytes = json.dumps({
-        "servico": "Robo2 Signals API",
-        "versao": "2.9.0",
-        "tipo_mensagem": "alerta_fissura_autonomo",
-        "emitido_em": datetime.now(BRT).isoformat(),
-        "pagamento_x402": {
-            "endpoint_completo": "/radar/itens",
-            "protocolo": "x402",
-            "moeda": MOEDA_PAGAMENTO,
-            "rede": REDE_PAGAMENTO,
-            "preco_usdc": PRECO_USDC,
-            "payTo": PAY_TO_ADDRESS
-        },
-        "evento": evento_fissura
-    }).encode("utf-8")
-
-    for hook in alvos_hook:
-        t = threading.Thread(
-            target=_enviar_webhook_com_retentativa,
-            args=(hook, codigo, payload_bytes),
-            daemon=True
-        )
-        t.start()
-
-
-def registrar_fissura(codigo: str, gravidade: str, origem: str, detalhe: str, sugestao_acao: str):
-    evento_fissura = {
-        "hora": hora_atual_brt(),
-        "codigo": codigo,
-        "gravidade": gravidade,
-        "origem": origem,
-        "detalhe": detalhe,
-        "sugestao_acao": sugestao_acao
-    }
-    ESTADO_VIGILANCIA["fissuras_ativas"].appendleft(evento_fissura)
-    status_painel = "erro" if gravidade == "critico" else "chamada"
-    registrar_evento(f"FISSURA • {gravidade.upper()}", f"[{origem}] {detalhe}", 0.0, status_painel)
-    despachar_webhooks_fissura(evento_fissura)
-    return evento_fissura
-
-
-def consultar_saldo_solana_usdc(forcar: bool = False) -> dict:
-    agora = time.time()
-    if not forcar and agora < ESTADO_VIGILANCIA.get("rpc_pausado_ate", 0.0):
-        return {"ok": True, "saldo_usdc": 0.0, "em_resfriamento": True}
-
-    try:
-        rpc_body = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
-            "params": [PAY_TO_ADDRESS, {"mint": USDC_MINT_SOLANA}, {"encoding": "jsonParsed"}]
-        }).encode("utf-8")
-        req = urllib.request.Request(SOLANA_RPC_URL, data=rpc_body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            contas = json.loads(resp.read().decode("utf-8")).get("result", {}).get("value", [])
-        saldo = sum(
-            float(c.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {}).get("uiAmount") or 0)
-            for c in contas
-        )
-        ESTADO_VIGILANCIA["rpc_pausado_ate"] = 0.0
-        return {"ok": True, "saldo_usdc": round(saldo, 4)}
-    except Exception:
-        # Esfria consulta de saldo por 5 min para não ficar repetindo erro de RPC a toda hora
-        ESTADO_VIGILANCIA["rpc_pausado_ate"] = agora + 300
-        return {"ok": False, "saldo_usdc": 0.0}
-
-
-def validar_pagamento_solana_usdc(assinatura_tx: str) -> tuple[bool, str]:
-    assinatura = assinatura_tx.strip()
-    if assinatura.startswith("{"):
-        try:
-            payload = json.loads(assinatura)
-            assinatura = (payload.get("signature") or payload.get("txHash") or payload.get("payload", {}).get("signature") or "").strip()
-        except Exception:
-            return False, "Comprovante JSON inválido."
-    if len(assinatura) < 40:
-        return False, "Assinatura Solana inválida."
-
-    rpc_body = json.dumps({
-        "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-        "params": [assinatura, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}]
-    }).encode("utf-8")
-
-    try:
-        req = urllib.request.Request(SOLANA_RPC_URL, data=rpc_body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            resultado = json.loads(resp.read().decode("utf-8")).get("result")
-        if not resultado:
-            return False, "Transação não confirmada na Solana."
-        meta = resultado.get("meta") or {}
-        if meta.get("err") is not None:
-            return False, "Transação falhou na Solana."
-
-        pre = {
-            b["accountIndex"]: float(b.get("uiTokenAmount", {}).get("uiAmount") or 0)
-            for b in meta.get("preTokenBalances", [])
-            if b.get("mint") == USDC_MINT_SOLANA and b.get("owner") == PAY_TO_ADDRESS
-        }
-        post = {
-            b["accountIndex"]: float(b.get("uiTokenAmount", {}).get("uiAmount") or 0)
-            for b in meta.get("postTokenBalances", [])
-            if b.get("mint") == USDC_MINT_SOLANA and b.get("owner") == PAY_TO_ADDRESS
-        }
-        recebido = sum(post.get(idx, 0.0) - pre.get(idx, 0.0) for idx in post)
-        if recebido + 1e-9 >= PRECO_USDC:
-            return True, f"Confirmado {recebido:.4f} USDC ({assinatura[:12]}...)"
-        return False, f"Valor insuficiente ({recebido:.4f} USDC)."
-    except Exception as e:
-        return False, f"Erro Solana: {str(e)}"
-
-
-def extrair_defillama(limite: int = 10):
-    url_llama = f"https://coins.llama.fi/prices/current/{COINS_DEFILLAMA}"
-    req = urllib.request.Request(url_llama, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.9)"})
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        coins = json.loads(resp.read().decode("utf-8")).get("coins", {})
-
-    itens = []
-    for chave, info in coins.items():
-        simbolo = (info.get("symbol") or chave.split(":")[-1]).upper()
-        preco = info.get("price")
-        confianca = info.get("confidence", 0)
-        if preco is not None:
-            if simbolo == "BTC":
-                ESTADO_VIGILANCIA["ultimo_btc_llama"] = float(preco)
-            itens.append({
-                "titulo": f"{simbolo}-USD (DefiLlama): ${preco}",
-                "preco": float(preco),
-                "simbolo": simbolo,
-                "confianca": confianca,
-                "link": "https://defillama.com",
-                "tipo": "cotacao_onchain"
-            })
-    return itens[:limite]
-
-
-def extrair_dexscreener(limite: int = 8):
-    itens = []
-    for idx, termo in enumerate(QUERIES_DEXSCREENER):
-        if idx > 0:
-            time.sleep(1.2)
-        url_dex = f"https://api.dexscreener.com/latest/dex/search?q={termo}"
-        req = urllib.request.Request(url_dex, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.9)"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            pares = json.loads(resp.read().decode("utf-8")).get("pairs", [])[:2]
-
-        for p in pares:
-            base_sym = (p.get("baseToken") or {}).get("symbol", "?")
-            quote_sym = (p.get("quoteToken") or {}).get("symbol", "?")
-            chain = p.get("chainId", "dex")
-            preco_usd = p.get("priceUsd", "?")
-            var_24h = (p.get("priceChange") or {}).get("h24", 0)
-            liq_usd = (p.get("liquidity") or {}).get("usd", 0)
-            itens.append({
-                "titulo": f"[{chain.upper()}] {base_sym}/{quote_sym}: ${preco_usd} (24h: {var_24h}% | Liq: ${int(liq_usd):,})",
-                "chain": chain,
-                "var_24h": float(var_24h or 0),
-                "link": p.get("url", "https://dexscreener.com"),
-                "tipo": "par_dex"
-            })
-    return itens[:limite]
-
-
-def extrair_itens_feed(url: str, limite: int = 5):
-    if url == "descentralizado://defillama":
-        return extrair_defillama(limite=max(limite, 8))
-    if url == "descentralizado://dexscreener":
-        return extrair_dexscreener(limite=max(limite, 6))
-
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.9)", "Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
-
-    if raw.lstrip().startswith("{"):
-        data = json.loads(raw).get("data", {})
-        valor = data.get("amount")
-        return [{
-            "titulo": f"{data.get('base', 'BTC')}-{data.get('currency', 'USD')} (Coinbase): ${valor}",
-            "preco": float(valor) if valor else None,
-            "link": url,
-            "tipo": "cotacao_spot"
-        }]
-
-    root = ET.fromstring(raw)
-    itens = []
-    for item in root.findall(".//item")[:limite]:
-        titulo = (item.findtext("title") or "").strip()
-        if titulo:
-            itens.append({
-                "titulo": titulo,
-                "link": (item.findtext("link") or "").strip(),
-                "publicado_em": (item.findtext("pubDate") or "").strip(),
-                "tipo": "manchete"
-            })
-    if not itens:
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        for entry in root.findall(".//atom:entry", ns)[:limite]:
-            titulo = (entry.findtext("atom:title", default="", namespaces=ns)).strip()
-            link_el = entry.find("atom:link", ns)
-            if titulo:
-                itens.append({
-                    "titulo": titulo,
-                    "link": link_el.attrib.get("href", "") if link_el is not None else "",
-                    "publicado_em": (entry.findtext("atom:updated", default="", namespaces=ns)).strip(),
-                    "tipo": "manchete"
-                })
-    return itens
-
-
-def _calcular_proximo_intervalo(teve_oportunidade: bool, teve_bloqueio_429: bool) -> tuple[int, str]:
-    """Decide autonomamente quando será a próxima varredura com base no mercado e em bloqueios."""
-    hora = datetime.now(BRT).hour
-    fator_horario = 0.85 if 8 <= hora <= 22 else 1.35
-
-    if teve_bloqueio_429:
-        prox = min(INTERVALO_MAX_SEG, int(max(INTERVALO_BASE_SEG * 1.5, ESTADO_VIGILANCIA["proximo_intervalo_seg"] * 1.4)))
-        return prox, "RESFRIANDO (429)"
-
-    if teve_oportunidade:
-        prox = max(INTERVALO_MIN_SEG, int(INTERVALO_MIN_SEG * fator_horario))
-        return prox, "JANELA QUENTE"
-
-    prox = int(max(INTERVALO_MIN_SEG, min(INTERVALO_MAX_SEG, INTERVALO_BASE_SEG * fator_horario)))
-    estrategia = "MERCADO ATIVO" if 8 <= hora <= 22 else "MODO ECONÔMICO"
-    return prox, estrategia
-
-
-def executar_varredura_proativa(origem_gatilho: str = "AUTO"):
-    fissuras_novas = []
-    total_sinais_coletados = 0
-    teve_oportunidade = False
-    teve_bloqueio_429 = False
-    agora_ts = time.time()
-
-    for alvo in TARGETS:
-        if agora_ts < ESTADO_VIGILANCIA["fonte_pausada_ate"].get(alvo["id"], 0.0):
-            cache_resfriado = ESTADO_VIGILANCIA["cache_coleta"].get(alvo["id"])
-            if cache_resfriado:
-                total_sinais_coletados += cache_resfriado.get("total_itens", 0)
-            continue
-
-        inicio = time.time()
-        try:
-            itens = extrair_itens_feed(alvo["url"], limite=6)
-            latencia = round(time.time() - inicio, 2)
-
-            if not itens:
-                ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] += 1
-                if ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] >= 2:
-                    ESTADO_VIGILANCIA["fonte_pausada_ate"][alvo["id"]] = agora_ts + 420
-                    fissuras_novas.append(registrar_fissura(
-                        "FONTE_VAZIA", "critico", alvo["id"],
-                        f"{alvo['fonte']} retornou 0 itens (em resfriamento 7m).",
-                        "Servir último cache válido aos agentes."
-                    ))
-                continue
-
-            ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] = 0
-            ESTADO_VIGILANCIA["fonte_pausada_ate"][alvo["id"]] = 0.0
-            ESTADO_VIGILANCIA["cache_coleta"][alvo["id"]] = {
-                "id": alvo["id"],
-                "fonte": alvo["fonte"],
-                "categoria": alvo["categoria"],
-                "status": "online",
-                "latencia_s": latencia,
-                "atualizado_em": hora_atual_brt(),
-                "total_itens": len(itens),
-                "itens": itens
-            }
-            total_sinais_coletados += len(itens)
-
-            if latencia > 4.5:
-                fissuras_novas.append(registrar_fissura(
-                    "FONTE_LENTA", "aviso", alvo["id"],
-                    f"{alvo['fonte']} respondeu em {latencia}s.",
-                    "Priorizar leitura em cache para evitar atraso no /radar/itens."
-                ))
-
-            if alvo["id"] == "crypto_btc_usd" and itens[0].get("preco"):
-                atual_cb = float(itens[0]["preco"])
-                anterior_cb = ESTADO_VIGILANCIA["ultimo_btc_coinbase"]
-                if anterior_cb:
-                    var_pct = ((atual_cb - anterior_cb) / anterior_cb) * 100
-                    if abs(var_pct) >= 1.2:
-                        teve_oportunidade = True
-                        fissuras_novas.append(registrar_fissura(
-                            "BTC_VOLATILIDADE", "oportunidade", "crypto_btc_usd",
-                            f"BTC variou {var_pct:+.2f}% (${anterior_cb:.2f} -> ${atual_cb:.2f}).",
-                            "Sinal quente pronto para disparo via webhook."
-                        ))
-                ESTADO_VIGILANCIA["ultimo_btc_coinbase"] = atual_cb
-
-            if alvo["id"] == "dexscreener_redes":
-                for it in itens:
-                    var24 = abs(float(it.get("var_24h", 0)))
-                    if var24 >= 15.0:
-                        teve_oportunidade = True
-                        fissuras_novas.append(registrar_fissura(
-                            "DEX_MOVIMENTO_FORTE", "oportunidade", "dexscreener_redes",
-                            f"Movimento forte detectado: {it['titulo'][:85]}",
-                            "Destacar par no pacote pago de sinais."
-                        ))
-                        break
-
-            for it in itens:
-                if it.get("tipo") == "manchete":
-                    titulo = it["titulo"]
-                    if titulo not in ESTADO_VIGILANCIA["ultimos_titulos_vistos"]:
-                        ESTADO_VIGILANCIA["ultimos_titulos_vistos"].append(titulo)
-                        if any(p in titulo.lower() for p in PALAVRAS_CHAVE_SINAL):
-                            teve_oportunidade = True
-                            fissuras_novas.append(registrar_fissura(
-                                "SINAL_MACRO_IMPACTO", "oportunidade", alvo["id"],
-                                f"Manchete relevante: {titulo[:90]}",
-                                "Cruzar com variação on-chain para venda aos agentes."
-                            ))
-
-        except Exception as e:
-            erro_str = str(e)
-            is_429 = "429" in erro_str or "Too Many Requests" in erro_str
-            if is_429:
-                teve_bloqueio_429 = True
-
-            ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] += 1
-            if ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]] >= 2:
-                fator_falha = min(4, ESTADO_VIGILANCIA["falhas_consecutivas_fonte"][alvo["id"]])
-                pausa_seg = (600 if is_429 else 300) * fator_falha
-                ESTADO_VIGILANCIA["fonte_pausada_ate"][alvo["id"]] = agora_ts + pausa_seg
-                fissuras_novas.append(registrar_fissura(
-                    "FONTE_BLOQUEADA_429" if is_429 else "FONTE_OFFLINE",
-                    "critico", alvo["id"],
-                    f"{alvo['fonte']} em resfriamento ({pausa_seg // 60}m): {erro_str[:55]}",
-                    "Fonte pausada temporariamente para evitar bloqueio contínuo."
-                ))
-
-    btc_cb = ESTADO_VIGILANCIA["ultimo_btc_coinbase"]
-    btc_ll = ESTADO_VIGILANCIA["ultimo_btc_llama"]
-    if btc_cb and btc_ll and btc_cb > 0:
-        spread_pct = abs((btc_cb - btc_ll) / btc_cb) * 100
-        if spread_pct >= 0.6:
-            teve_oportunidade = True
-            fissuras_novas.append(registrar_fissura(
-                "DIVERGENCIA_CEX_DEX", "oportunidade", "arbitragem_btc",
-                f"Spread BTC Coinbase (${btc_cb:.2f}) vs DefiLlama (${btc_ll:.2f}): {spread_pct:.2f}%.",
-                "Sinal de arbitragem pronto para agentes."
-            ))
-
-    prox_seg, estrategia = _calcular_proximo_intervalo(teve_oportunidade, teve_bloqueio_429)
-    ESTADO_VIGILANCIA["proximo_intervalo_seg"] = prox_seg
-    ESTADO_VIGILANCIA["estrategia_ritmo"] = estrategia
-    ESTADO_VIGILANCIA["ultima_varredura_brt"] = hora_atual_brt()
-
-    registrar_evento(
-        f"VARREDURA ({origem_gatilho})",
-        f"{len(TARGETS)} fontes • {total_sinais_coletados} sinais • próximo em {prox_seg}s ({estrategia})",
-        total_sinais_coletados,
-        "saida"
-    )
+# ==============================================================================
+# ESTADO PERSISTENTE EM DISCO
+# ==============================================================================
+def _default_state() -> Dict[str, Any]:
     return {
-        "varrido_em": ESTADO_VIGILANCIA["ultima_varredura_brt"],
-        "sinais_coletados": total_sinais_coletados,
-        "fissuras_detectadas": len(fissuras_novas),
-        "proximo_intervalo_seg": prox_seg,
-        "estrategia_ritmo": estrategia,
-        "fissuras": fissuras_novas
+        "version": APP_VERSION,
+        "phantom_usdc_balance": 0.0,
+        "approved_sales_usdc": 0.0,
+        "approved_sales_count": 0,
+        "x402_charges_count": 0,
+        "total_calls": 3,
+        "fissures_count": 1,
+        "hooks_triggered_count": 0,
+        "signals_collected_count": 0,
+        "rhythm_mode": "NORMAL",
+        "cooldown_remaining_sec": 0,
+        "last_scan_at": None,
+        "next_scan_at": None,
+        "webhooks": [],
+        "signals": [
+            {
+                "id": "init-1",
+                "source": "econ_cnbc",
+                "title": "Manchete relevante: Monitoramento de fissuras e catalisadores ativos",
+                "kind": "FISSURA • OPORTUNIDADE",
+                "value_label": "27 itens",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+        "activity_log": [
+            {
+                "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "type": "CHAMADA",
+                "detail": "Consulta de status da API",
+                "value": "-",
+            }
+        ],
+        "hourly_stats": {},
     }
 
 
-async def loop_vigilancia_background():
-    await asyncio.sleep(2)
+def load_state() -> Dict[str, Any]:
+    if not STATE_FILE.exists():
+        st = _default_state()
+        save_state(st)
+        return st
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        base = _default_state()
+        base.update(data)
+        base["version"] = APP_VERSION
+        return base
+    except Exception:
+        return _default_state()
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    tmp_file = STATE_FILE.with_suffix(".tmp")
+    tmp_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_file.replace(STATE_FILE)
+
+
+STATE_LOCK = asyncio.Lock()
+STATE: Dict[str, Any] = load_state()
+COOLDOWN_UNTIL_TS: float = 0.0
+
+
+def _bump_hourly(state: Dict[str, Any], field: str, amount: float = 1.0) -> None:
+    hour_key = datetime.now().strftime("%H:00")
+    bucket = state["hourly_stats"].setdefault(
+        hour_key, {"charges": 0, "signals": 0, "approved_usdc": 0.0}
+    )
+    bucket[field] = bucket.get(field, 0) + amount
+
+
+def _push_log(state: Dict[str, Any], log_type: str, detail: str, value: str = "-") -> None:
+    state["activity_log"].insert(
+        0,
+        {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "type": log_type,
+            "detail": detail,
+            "value": value,
+        },
+    )
+    state["activity_log"] = state["activity_log"][:120]
+
+
+def _refresh_rhythm(state: Dict[str, Any]) -> None:
+    now = time.time()
+    if COOLDOWN_UNTIL_TS > now:
+        rem = int(round(COOLDOWN_UNTIL_TS - now))
+        state["rhythm_mode"] = f"RESFRIANDO (429) ({RATE_LIMIT_COOLDOWN_SEC}s)"
+        state["cooldown_remaining_sec"] = rem
+    else:
+        state["rhythm_mode"] = "ATIVO (ADAPTATIVO)"
+        state["cooldown_remaining_sec"] = 0
+
+
+# ==============================================================================
+# MOTOR DE VARREDURA COM RITMO ADAPTATIVO (429) E WEBHOOKS AUTÔNOMOS
+# ==============================================================================
+async def dispatch_webhooks(state: Dict[str, Any], payload: Dict[str, Any]) -> int:
+    hooks = state.get("webhooks", [])
+    if not hooks:
+        return 0
+    sent = 0
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for h in hooks:
+            if not h.get("active", True):
+                continue
+            try:
+                resp = await client.post(h["webhook_url"], json=payload)
+                if 200 <= resp.status_code < 300:
+                    sent += 1
+                    state["hooks_triggered_count"] = state.get("hooks_triggered_count", 0) + 1
+            except Exception:
+                continue
+    return sent
+
+
+async def run_scan_cycle(force: bool = False) -> Dict[str, Any]:
+    global COOLDOWN_UNTIL_TS
+    async with STATE_LOCK:
+        now = time.time()
+        if not force and COOLDOWN_UNTIL_TS > now:
+            _refresh_rhythm(STATE)
+            save_state(STATE)
+            return {
+                "status": "cooling_down",
+                "cooldown_remaining_sec": STATE["cooldown_remaining_sec"],
+            }
+
+        hit_429 = False
+        collected_items: List[Dict[str, Any]] = []
+        sources_checked = 0
+
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            headers={"User-Agent": f"Robo2Signals/{APP_VERSION} (+{PUBLIC_BASE_URL})"},
+        ) as client:
+            for feed in FEEDS:
+                sources_checked += 1
+                try:
+                    r = await client.get(feed["url"])
+                    if r.status_code == 429:
+                        hit_429 = True
+                        break
+                    if r.status_code == 200:
+                        text = r.text
+                        # Extração leve de títulos/itens para sinal estruturado
+                        snippet = text.strip().replace("\n", " ")[:180]
+                        item = {
+                            "id": f"{feed['id']}-{int(now * 1000)}",
+                            "source": feed["id"],
+                            "source_name": feed["name"],
+                            "title": f"[{feed['id']}] Sinal capturado: {snippet}",
+                            "kind": "FISSURA • OPORTUNIDADE" if "429" not in snippet else "SINAL",
+                            "value_label": "1 item",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                        collected_items.append(item)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response is not None and exc.response.status_code == 429:
+                        hit_429 = True
+                        break
+                except Exception:
+                    continue
+
+        now_iso = datetime.now().strftime("%H:%M:%S")
+        STATE["last_scan_at"] = now_iso
+        STATE["total_calls"] = STATE.get("total_calls", 0) + 1
+
+        if hit_429:
+            COOLDOWN_UNTIL_TS = time.time() + RATE_LIMIT_COOLDOWN_SEC
+            _refresh_rhythm(STATE)
+            STATE["next_scan_at"] = datetime.fromtimestamp(COOLDOWN_UNTIL_TS).strftime("%H:%M:%S")
+            _push_log(
+                STATE,
+                "VARREDURA (AUTO)",
+                f"{sources_checked} fontes • rate limit 429 • próximo em {RATE_LIMIT_COOLDOWN_SEC}s ({STATE['rhythm_mode']})",
+                "429",
+            )
+            save_state(STATE)
+            return {
+                "status": "rate_limited_429",
+                "cooldown_sec": RATE_LIMIT_COOLDOWN_SEC,
+            }
+
+        # Varredura concluída sem 429
+        COOLDOWN_UNTIL_TS = 0.0
+        _refresh_rhythm(STATE)
+        next_ts = time.time() + BASE_SCAN_INTERVAL_SEC
+        STATE["next_scan_at"] = datetime.fromtimestamp(next_ts).strftime("%H:%M:%S")
+
+        new_count = len(collected_items)
+        STATE["signals_collected_count"] = STATE.get("signals_collected_count", 0) + new_count
+        STATE["fissures_count"] = STATE.get("fissures_count", 0) + new_count
+        _bump_hourly(STATE, "signals", float(new_count))
+
+        for it in reversed(collected_items):
+            STATE["signals"].insert(0, it)
+        STATE["signals"] = STATE["signals"][:200]
+
+        _push_log(
+            STATE,
+            "VARREDURA (AUTO)",
+            f"{sources_checked} fontes • {new_count} sinais • próximo em {BASE_SCAN_INTERVAL_SEC}s ({STATE['rhythm_mode']})",
+            f"{new_count} itens",
+        )
+
+        if collected_items:
+            await dispatch_webhooks(
+                STATE,
+                {
+                    "version": APP_VERSION,
+                    "event": "signal.opportunity",
+                    "x402": {
+                        "protocol": "x402",
+                        "network": "solana",
+                        "asset": "USDC",
+                        "amount": PRICE_USDC,
+                        "pay_to": SOLANA_PAY_TO,
+                        "resource": f"{PUBLIC_BASE_URL}/radar/itens",
+                    },
+                    "items": collected_items[:10],
+                },
+            )
+
+        save_state(STATE)
+        return {"status": "ok", "sources_checked": sources_checked, "collected": new_count}
+
+
+async def _background_scanner_loop() -> None:
     while True:
         try:
-            await asyncio.to_thread(executar_varredura_proativa, "AUTO")
-        except Exception as e:
-            registrar_evento("ERRO LOOP", f"Falha na varredura automática: {str(e)[:70]}", 0.0, "erro")
-        await asyncio.sleep(ESTADO_VIGILANCIA.get("proximo_intervalo_seg", INTERVALO_BASE_SEG))
+            if AUTO_SCAN_ENABLED:
+                await run_scan_cycle(force=False)
+        except Exception:
+            pass
+        async with STATE_LOCK:
+            _refresh_rhythm(STATE)
+            rem = STATE.get("cooldown_remaining_sec", 0)
+        sleep_for = rem if rem > 0 else BASE_SCAN_INTERVAL_SEC
+        await asyncio.sleep(max(10, min(sleep_for, 600)))
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    carregar_webhooks_disco()
-    tarefa = asyncio.create_task(loop_vigilancia_background())
-    yield
-    tarefa.cancel()
+@app.on_event("startup")
+async def on_startup() -> None:
+    async with STATE_LOCK:
+        _refresh_rhythm(STATE)
+        save_state(STATE)
+    asyncio.create_task(_background_scanner_loop())
 
 
-app = FastAPI(
-    title="Robo2 Signals API",
-    description="API proativa e adaptativa de sinais estruturados em tempo real via x402 em USDC (Solana) com Webhooks Autônomos.",
-    version="2.9.0",
-    lifespan=lifespan
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"]
-)
+# ==============================================================================
+# MANIFESTOS DE AUTODESCOBERTA (B2B / BOT-TO-BOT / X402 / SOLANA)
+# ==============================================================================
+def _base_url_from_request(request: Request) -> str:
+    req_base = str(request.base_url).rstrip("/") if request.base_url else ""
+    return req_base or PUBLIC_BASE_URL
 
 
-def montar_manifesto_x402(resource_url: str):
-    return {
-        "x402Version": 1,
-        "error": "Payment Required",
-        "accepts": [{
-            "scheme": "exact",
-            "network": REDE_PAGAMENTO,
-            "asset": USDC_MINT_SOLANA,
-            "currency": MOEDA_PAGAMENTO,
-            "payTo": PAY_TO_ADDRESS,
-            "maxAmountRequired": str(int(round(PRECO_USDC * 1_000_000))),
-            "amountUSDC": f"{PRECO_USDC:.2f}",
-            "resource": resource_url,
-            "description": "Sinais estruturados em tempo real de Economia, Tech, Cripto Multi-Redes e Fissuras.",
-            "mimeType": "application/json"
-        }]
-    }
-
-
-@app.get("/")
-def root():
-    registrar_evento("CHAMADA /", "Consulta de status da API", 0.0, "chamada")
-    return {
-        "status": "online",
-        "servico": "Robo2 Signals API",
-        "versao": "2.9.0",
-        "modo": "autonomo_adaptativo",
-        "estrategia_ritmo": ESTADO_VIGILANCIA["estrategia_ritmo"],
-        "proximo_intervalo_seg": ESTADO_VIGILANCIA["proximo_intervalo_seg"],
-        "ultima_varredura": ESTADO_VIGILANCIA["ultima_varredura_brt"],
-        "moeda": MOEDA_PAGAMENTO,
-        "rede": REDE_PAGAMENTO,
-        "recebedor": PAY_TO_ADDRESS,
-        "preco_usdc": f"{PRECO_USDC:.2f}",
-        "rotas": {
-            "painel": "/painel",
-            "radar": "/radar",
-            "itens_x402": "/radar/itens",
-            "fissuras": "/api/fissuras",
-            "forcar_varredura": "/api/varrer-agora",
-            "webhooks": "/webhooks",
-            "registrar_webhook": "/webhooks/registrar",
-            "x402": "/.well-known/x402",
-            "agente": "/.well-known/agent.json",
-            "openapi": "/openapi.json"
+@app.get("/.well-known/x402", tags=["discovery", "x402"])
+async def well_known_x402(request: Request) -> JSONResponse:
+    base_url = _base_url_from_request(request)
+    return JSONResponse(
+        content={
+            "x402Version": 1,
+            "name": SERVICE_NAME,
+            "version": APP_VERSION,
+            "autonomous_b2b": True,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "solana",
+                    "maxAmountRequired": PRICE_USDC,
+                    "asset": "USDC",
+                    "usdcMint": USDC_SOLANA_MINT,
+                    "payTo": SOLANA_PAY_TO,
+                    "resource": f"{base_url}/radar/itens",
+                    "description": "Acesso máquina-a-máquina aos sinais e fissuras detectadas em tempo real pelo Robo2.",
+                    "mimeType": "application/json",
+                }
+            ],
+            "endpoints": {
+                "data": f"{base_url}/radar/itens",
+                "agentManifest": f"{base_url}/.well-known/agent.json",
+                "pluginManifest": f"{base_url}/.well-known/ai-plugin.json",
+                "openapi": f"{base_url}/openapi.json",
+            },
         }
-    }
+    )
 
 
-@app.get("/webhooks")
-def listar_webhooks():
-    registrar_evento("CHAMADA /webhooks", f"{len(ESTADO_VIGILANCIA['webhooks_inscritos'])} webhooks cadastrados", 0.0, "chamada")
-    return {
-        "total": len(ESTADO_VIGILANCIA["webhooks_inscritos"]),
-        "cooldown_seg": COOLDOWN_WEBHOOK_SEG,
-        "max_falhas_antes_pausa": MAX_FALHAS_WEBHOOK,
-        "webhooks": ESTADO_VIGILANCIA["webhooks_inscritos"]
-    }
+@app.get("/.well-known/agent.json", tags=["discovery", "agents"])
+async def well_known_agent_json(request: Request) -> JSONResponse:
+    base_url = _base_url_from_request(request)
+    return JSONResponse(
+        content={
+            "schema_version": "1.0",
+            "name": SERVICE_NAME,
+            "version": APP_VERSION,
+            "description": "Provedor autônomo de sinais e fissuras em tempo real com pagamento automático x402 em USDC na Solana.",
+            "url": base_url,
+            "capabilities": {
+                "bot_to_bot_monetization": True,
+                "autonomous_discovery": True,
+                "adaptive_rate_limit_429": True,
+                "autonomous_webhooks": True,
+            },
+            "payment": {
+                "protocol": "x402",
+                "network": "solana",
+                "asset": "USDC",
+                "usdc_mint": USDC_SOLANA_MINT,
+                "price_per_request": PRICE_USDC,
+                "pay_to": SOLANA_PAY_TO,
+                "target_endpoint": f"{base_url}/radar/itens",
+            },
+            "resources": [
+                {
+                    "path": "/radar/itens",
+                    "method": "GET",
+                    "payment_protocol": "x402",
+                    "summary": "Retorna sinais coletados e oportunidades/fissuras recentes.",
+                }
+            ],
+            "discovery": {
+                "x402": f"{base_url}/.well-known/x402",
+                "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
+                "openapi": f"{base_url}/openapi.json",
+            },
+        }
+    )
 
 
-@app.post("/webhooks/registrar")
-def registrar_webhook(dados: WebhookCadastro):
-    url_limpa = dados.url.strip()
-    if not (url_limpa.startswith("https://") or url_limpa.startswith("http://")):
-        return JSONResponse(status_code=400, content={"erro": "URL de webhook inválida. Use http:// ou https://"})
-
-    cliente_id = (dados.cliente_id or "").strip() or f"agente_{abs(hash(url_limpa)) % 10000}"
-    carteira = (dados.carteira_solana or "").strip() or None
-    acao = "cadastrado"
-
-    with LOCK_WEBHOOKS:
-        alvo_hook = None
-        for w in ESTADO_VIGILANCIA["webhooks_inscritos"]:
-            if w["url"] == url_limpa:
-                w["gravidades"] = dados.gravidades
-                w["cliente_id"] = cliente_id
-                w["carteira_solana"] = carteira
-                w["ativo"] = True
-                w["falhas_seguidas"] = 0
-                alvo_hook = w
-                acao = "atualizado"
-                break
-
-        if alvo_hook is None:
-            alvo_hook = {
-                "url": url_limpa,
-                "gravidades": dados.gravidades,
-                "cliente_id": cliente_id,
-                "carteira_solana": carteira,
-                "ativo": True,
-                "envios_ok": 0,
-                "falhas_seguidas": 0,
-                "ultimo_envio_brt": None,
-                "criado_em": hora_atual_brt()
-            }
-            ESTADO_VIGILANCIA["webhooks_inscritos"].append(alvo_hook)
-
-    salvar_webhooks_disco()
-    registrar_evento(f"WEBHOOK {acao.upper()}", f"[{cliente_id}] {url_limpa}", 0.0, "chamada")
-
-    boas_vindas = json.dumps({
-        "servico": "Robo2 Signals API",
-        "versao": "2.9.0",
-        "tipo_mensagem": "assinatura_confirmada",
-        "emitido_em": datetime.now(BRT).isoformat(),
-        "pagamento_x402": {
-            "endpoint_completo": "/radar/itens",
-            "protocolo": "x402",
-            "moeda": MOEDA_PAGAMENTO,
-            "rede": REDE_PAGAMENTO,
-            "preco_usdc": PRECO_USDC,
-            "payTo": PAY_TO_ADDRESS
-        },
-        "ultima_fissura": ESTADO_VIGILANCIA["fissuras_ativas"][0] if ESTADO_VIGILANCIA["fissuras_ativas"] else None
-    }).encode("utf-8")
-    threading.Thread(
-        target=_enviar_webhook_com_retentativa,
-        args=(alvo_hook, "ASSINATURA_ATIVA", boas_vindas),
-        daemon=True
-    ).start()
-
-    return {"status": acao, "webhook": alvo_hook}
+@app.get("/.well-known/ai-plugin.json", tags=["discovery", "agents"])
+async def well_known_ai_plugin(request: Request) -> JSONResponse:
+    base_url = _base_url_from_request(request)
+    return JSONResponse(
+        content={
+            "schema_version": "v1",
+            "name_for_human": SERVICE_NAME,
+            "name_for_model": "robo2_signals_x402",
+            "description_for_human": "Sinais e fissuras em tempo real com cobrança automática em USDC na Solana via x402.",
+            "description_for_model": (
+                f"API de sinais ({APP_VERSION}) para consumo máquina-a-máquina. "
+                f"Requer pagamento x402 em USDC (Solana) para acessar {base_url}/radar/itens."
+            ),
+            "auth": {
+                "type": "x402",
+                "network": "solana",
+                "asset": "USDC",
+                "pay_to": SOLANA_PAY_TO,
+            },
+            "api": {"type": "openapi", "url": f"{base_url}/openapi.json"},
+            "logo_url": f"{base_url}/static/logo.png",
+            "contact_email": "contato@lentenoir.com",
+            "legal_info_url": base_url,
+        }
+    )
 
 
-@app.delete("/webhooks")
-def remover_webhook(url: str = Query(...)):
-    with LOCK_WEBHOOKS:
-        antes = len(ESTADO_VIGILANCIA["webhooks_inscritos"])
-        ESTADO_VIGILANCIA["webhooks_inscritos"] = [
-            w for w in ESTADO_VIGILANCIA["webhooks_inscritos"] if w["url"] != url.strip()
+# ==============================================================================
+# ROTAS DE DADOS (X402), WEBHOOKS AUTÔNOMOS E VARREDURA
+# ==============================================================================
+@app.get("/radar/itens", tags=["signals", "x402"])
+async def radar_itens(
+    request: Request,
+    limit: int = Query(default=25, ge=1, le=100),
+) -> JSONResponse:
+    """
+    Endpoint protegido por desafio x402:
+    Se o bot/cliente não enviar prova de pagamento no header `X-Payment` / `X-402-Payment`,
+    retorna HTTP 402 com as instruções exatas de pagamento em USDC na Solana.
+    """
+    base_url = _base_url_from_request(request)
+    payment_proof = (
+        request.headers.get("x-payment")
+        or request.headers.get("x-402-payment")
+        or request.headers.get("authorization")
+    )
+
+    async with STATE_LOCK:
+        _refresh_rhythm(STATE)
+        STATE["total_calls"] = STATE.get("total_calls", 0) + 1
+
+        if not payment_proof:
+            STATE["x402_charges_count"] = STATE.get("x402_charges_count", 0) + 1
+            _bump_hourly(STATE, "charges", 1.0)
+            _push_log(
+                STATE,
+                "COBRANÇA 402",
+                f"Desafio x402 emitido para /radar/itens ({PRICE_USDC} USDC/Solana)",
+                f"{PRICE_USDC} USDC",
+            )
+            save_state(STATE)
+            return JSONResponse(
+                status_code=402,
+                headers={"X-Accept-Payment": "x402"},
+                content={
+                    "error": "Payment Required",
+                    "protocol": "x402",
+                    "version": APP_VERSION,
+                    "accepts": [
+                        {
+                            "scheme": "exact",
+                            "network": "solana",
+                            "maxAmountRequired": PRICE_USDC,
+                            "asset": "USDC",
+                            "usdcMint": USDC_SOLANA_MINT,
+                            "payTo": SOLANA_PAY_TO,
+                            "resource": f"{base_url}/radar/itens",
+                        }
+                    ],
+                },
+            )
+
+        # Pagamento / comprovante recebido: registra operação aprovada e entrega os sinais
+        try:
+            amount_val = float(PRICE_USDC)
+        except ValueError:
+            amount_val = 0.0
+
+        STATE["approved_sales_count"] = STATE.get("approved_sales_count", 0) + 1
+        STATE["approved_sales_usdc"] = round(
+            STATE.get("approved_sales_usdc", 0.0) + amount_val, 6
+        )
+        STATE["phantom_usdc_balance"] = round(
+            STATE.get("phantom_usdc_balance", 0.0) + amount_val, 6
+        )
+        _bump_hourly(STATE, "approved_usdc", amount_val)
+        _push_log(
+            STATE,
+            "APROVADA",
+            f"Acesso /radar/itens liberado via x402 ({payment_proof[:18]}...)",
+            f"+{PRICE_USDC} USDC",
+        )
+        items = STATE.get("signals", [])[:limit]
+        save_state(STATE)
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "version": APP_VERSION,
+                "network": "solana",
+                "asset": "USDC",
+                "count": len(items),
+                "items": items,
+            },
+        )
+
+
+@app.post("/webhooks", tags=["webhooks"])
+async def create_webhook(req: WebhookCreateRequest) -> JSONResponse:
+    async with STATE_LOCK:
+        entry = {
+            "agent_id": req.agent_id.strip(),
+            "webhook_url": req.webhook_url.strip(),
+            "active": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        STATE["webhooks"] = [
+            w for w in STATE.get("webhooks", []) if w.get("agent_id") != entry["agent_id"]
         ]
-        removidos = antes - len(ESTADO_VIGILANCIA["webhooks_inscritos"])
-    salvar_webhooks_disco()
-    registrar_evento("WEBHOOK REMOVIDO", f"{url} ({removidos})", 0.0, "chamada")
-    return {"removidos": removidos}
+        STATE["webhooks"].append(entry)
+        _push_log(STATE, "WEBHOOK", f"Agente {entry['agent_id']} ativado -> {entry['webhook_url']}", "ATIVO")
+        save_state(STATE)
+        return JSONResponse(status_code=201, content={"status": "active", "webhook": entry})
 
 
-@app.post("/api/varrer-agora")
-@app.get("/api/varrer-agora")
-def varrer_agora():
-    return executar_varredura_proativa("MANUAL")
+@app.get("/webhooks", tags=["webhooks"])
+async def list_webhooks() -> JSONResponse:
+    async with STATE_LOCK:
+        return JSONResponse(content={"webhooks": STATE.get("webhooks", [])})
 
 
-@app.get("/api/fissuras")
-def listar_fissuras(executar_agora: bool = Query(default=False)):
-    registrar_evento("CHAMADA /api/fissuras", f"Consulta de fissuras (executar_agora={executar_agora})", 0.0, "chamada")
-    if executar_agora:
-        executar_varredura_proativa("API_FISSURAS")
-    return {
-        "hora_agora": hora_atual_brt(),
-        "ultima_varredura": ESTADO_VIGILANCIA["ultima_varredura_brt"],
-        "total_fissuras_registradas": len(ESTADO_VIGILANCIA["fissuras_ativas"]),
-        "fissuras": list(ESTADO_VIGILANCIA["fissuras_ativas"])
-    }
+@app.post("/varrer", tags=["scanner"])
+async def trigger_scan_now() -> JSONResponse:
+    result = await run_scan_cycle(force=True)
+    return JSONResponse(content={"version": APP_VERSION, "result": result})
 
 
-@app.get("/api/metricas")
-def obter_metricas():
-    carteira = consultar_saldo_solana_usdc(forcar=False)
-    horas_ordenadas = sorted(METRICAS["historico_horas"].values(), key=lambda x: x["hora"])[-8:]
-    with LOCK_WEBHOOKS:
-        lista_hooks = list(ESTADO_VIGILANCIA["webhooks_inscritos"])
-    return {
-        "hora_agora": hora_atual_brt(),
-        "iniciado_em": METRICAS["iniciado_em_brt"],
-        "ultima_varredura": ESTADO_VIGILANCIA["ultima_varredura_brt"],
-        "estrategia_ritmo": ESTADO_VIGILANCIA["estrategia_ritmo"],
-        "proximo_intervalo_seg": ESTADO_VIGILANCIA["proximo_intervalo_seg"],
-        "carteira": PAY_TO_ADDRESS,
-        "saldo_usdc": carteira.get("saldo_usdc", 0.0),
-        "receita_sessao_usdc": round(METRICAS["receita_sessao_usdc"], 4),
-        "vendas_pagas": METRICAS["total_vendas_pagas"],
-        "cobrancas_402": METRICAS["total_cobrancas_402"],
-        "itens_entregues": METRICAS["total_itens_entregues"],
-        "total_chamadas": METRICAS["total_chamadas"],
-        "total_webhooks_enviados": METRICAS["total_webhooks_enviados"],
-        "webhooks_ativos": sum(1 for w in lista_hooks if w.get("ativo", True)),
-        "webhooks_lista": lista_hooks,
-        "fissuras_ativas": len(ESTADO_VIGILANCIA["fissuras_ativas"]),
-        "grafico_horas": horas_ordenadas,
-        "eventos": list(METRICAS["eventos"])
-    }
+@app.get("/status", tags=["system"])
+async def api_status() -> JSONResponse:
+    async with STATE_LOCK:
+        _refresh_rhythm(STATE)
+        return JSONResponse(
+            content={
+                "service": SERVICE_NAME,
+                "version": APP_VERSION,
+                "rhythm": STATE["rhythm_mode"],
+                "last_scan_at": STATE.get("last_scan_at"),
+                "next_scan_at": STATE.get("next_scan_at"),
+                "payment": {
+                    "protocol": "x402",
+                    "network": "solana",
+                    "asset": "USDC",
+                    "pay_to": SOLANA_PAY_TO,
+                    "price_usdc": PRICE_USDC,
+                },
+            }
+        )
 
 
-@app.get("/painel", response_class=HTMLResponse)
-def dashboard_visual():
-    return """<!DOCTYPE html>
+# ==============================================================================
+# PAINEL VISUAL WEB (GET / E GET /painel)
+# ==============================================================================
+def _render_dashboard_html(state: Dict[str, Any]) -> str:
+    _refresh_rhythm(state)
+    active_hooks = sum(1 for w in state.get("webhooks", []) if w.get("active"))
+    rows_html = ""
+    for row in state.get("activity_log", [])[:30]:
+        rows_html += (
+            f"<tr>"
+            f"<td>{row.get('time', '--:--:--')}</td>"
+            f"<td><span class='badge'>{row.get('type', '')}</span></td>"
+            f"<td>{row.get('detail', '')}</td>"
+            f"<td>{row.get('value', '-')}</td>"
+            f"</tr>"
+        )
+
+    hourly_json = json.dumps(state.get("hourly_stats", {}), ensure_ascii=False)
+
+    return f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Robo2 Painel — Operações e Chamadas em Tempo Real</title>
+  <title>{SERVICE_NAME} — v{APP_VERSION}</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background: #0d1117; color: #e6edf3; padding: 18px; }
-    .wrap { max-width: 980px; margin: 0 auto; }
-    .top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
-    .titulo { font-size: 1.25rem; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-    .ponto { width: 9px; height: 9px; border-radius: 50%; background: #2ea043; box-shadow: 0 0 8px #2ea043; }
-    .acoes-topo { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .hora-box { background: #161b22; border: 1px solid #30363d; padding: 6px 12px; border-radius: 8px; font-size: 0.82rem; color: #8b949e; }
-    .btn-varrer { background: #238636; color: #fff; border: none; padding: 7px 13px; border-radius: 8px; font-size: 0.82rem; font-weight: 600; cursor: pointer; }
-    .btn-varrer:hover { background: #2ea043; }
-    .btn-varrer:disabled { opacity: 0.6; cursor: wait; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 12px; margin-bottom: 18px; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 14px; }
-    .rotulo { font-size: 0.73rem; color: #8b949e; text-transform: uppercase; margin-bottom: 6px; }
-    .valor { font-size: 1.5rem; font-weight: 700; }
-    .verde { color: #3fb950; }
-    .amarelo { color: #d29922; }
-    .azul { color: #58a6ff; }
-    .roxo { color: #bc8cff; }
-    .sub { font-size: 0.74rem; color: #8b949e; margin-top: 4px; }
-    .caixa { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; margin-bottom: 18px; }
-    .caixa-topo { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
-    .caixa-topo h2 { font-size: 0.98rem; font-weight: 600; }
-    .legenda { display: flex; gap: 14px; font-size: 0.75rem; color: #8b949e; }
-    .legenda span { display: inline-flex; align-items: center; gap: 5px; }
-    .quad { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
-    .grafico { display: flex; align-items: flex-end; gap: 12px; height: 140px; padding-top: 12px; border-bottom: 1px solid #30363d; }
-    .coluna-grupo { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; justify-content: flex-end; }
-    .barras { display: flex; align-items: flex-end; gap: 4px; height: 105px; width: 100%; justify-content: center; }
-    .barra { width: 14px; border-radius: 4px 4px 0 0; min-height: 3px; transition: height 0.3s ease; }
-    .b-402 { background: #d29922; }
-    .b-saida { background: #58a6ff; }
-    .b-entrada { background: #3fb950; }
-    .hora-lbl { font-size: 0.72rem; color: #8b949e; margin-top: 6px; }
-    .hook-form { display: flex; gap: 8px; flex-wrap: wrap; width: 100%; }
-    .hook-input { flex: 1; min-width: 200px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 8px; padding: 8px 11px; font-size: 0.83rem; }
-    .hook-input.curto { flex: 0 1 180px; min-width: 140px; }
-    .btn-hook { background: #1f6feb; color: #fff; border: none; padding: 8px 14px; border-radius: 8px; font-size: 0.82rem; font-weight: 600; cursor: pointer; }
-    .btn-hook:hover { background: #388bfd; }
-    .hook-msg { font-size: 0.76rem; color: #8b949e; margin-top: 8px; }
-    .hook-lista { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
-    .hook-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 7px 10px; font-size: 0.78rem; }
-    .btn-rem { background: transparent; color: #f85149; border: 1px solid rgba(248,81,73,0.35); padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; cursor: pointer; }
-    .filtros { display: flex; gap: 6px; flex-wrap: wrap; }
-    .filtro-btn { background: #0d1117; color: #8b949e; border: 1px solid #30363d; padding: 4px 10px; border-radius: 999px; font-size: 0.74rem; cursor: pointer; }
-    .filtro-btn.ativo { background: #1f6feb; color: #fff; border-color: #1f6feb; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.83rem; }
-    th, td { padding: 9px 8px; border-bottom: 1px solid #21262d; text-align: left; }
-    th { color: #8b949e; font-size: 0.73rem; text-transform: uppercase; }
-    .pill { padding: 3px 9px; border-radius: 999px; font-size: 0.71rem; font-weight: 600; white-space: nowrap; display: inline-block; }
-    .p-aprovada { background: rgba(63,185,80,0.20); color: #3fb950; border: 1px solid rgba(63,185,80,0.45); }
-    .p-402 { background: rgba(210,153,34,0.16); color: #d29922; }
-    .p-chamada { background: rgba(88,166,255,0.15); color: #58a6ff; }
-    .p-erro { background: rgba(248,81,73,0.16); color: #f85149; }
-    .vazio { text-align: center; color: #8b949e; padding: 20px; }
+    * {{ box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+    body {{ margin: 0; background: #070d19; color: #e6edf7; padding: 20px; }}
+    .wrap {{ max-width: 1180px; margin: 0 auto; }}
+    .top {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }}
+    .title {{ font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 10px; }}
+    .dot {{ width: 10px; height: 10px; border-radius: 50%; background: #10b981; display: inline-block; }}
+    .meta-bar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 13px; }}
+    .pill {{ background: #121c30; border: 1px solid #243452; padding: 6px 12px; border-radius: 8px; }}
+    .btn {{ background: #16a34a; color: #fff; border: 0; padding: 7px 14px; border-radius: 8px; font-weight: 600; cursor: pointer; }}
+    .btn-blue {{ background: #2563eb; color: #fff; border: 0; padding: 8px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; }}
+    .grid-5 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }}
+    .card {{ background: #0d1627; border: 1px solid #1d2b44; border-radius: 12px; padding: 14px; }}
+    .card-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.4px; }}
+    .card-val {{ font-size: 24px; font-weight: 700; margin-top: 6px; }}
+    .green {{ color: #34d399; }}
+    .amber {{ color: #fbbf24; }}
+    .blue {{ color: #60a5fa; }}
+    .card-sub {{ font-size: 12px; color: #94a3b8; margin-top: 4px; }}
+    .section {{ background: #0d1627; border: 1px solid #1d2b44; border-radius: 12px; padding: 16px; margin-bottom: 16px; }}
+    .sec-title {{ font-size: 15px; font-weight: 700; margin-bottom: 12px; display: flex; justify-content: space-between; }}
+    .hook-row {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
+    .inp {{ background: #070d19; border: 1px solid #263859; color: #e6edf7; padding: 8px 12px; border-radius: 8px; min-width: 220px; flex: 1; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{ text-align: left; padding: 9px 8px; border-bottom: 1px solid #17243b; }}
+    th {{ color: #94a3b8; font-size: 11px; text-transform: uppercase; }}
+    .badge {{ background: #172554; color: #93c5fd; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="top">
-      <div class="titulo"><span class="ponto"></span> Robo2 Signals — Monitor Autônomo</div>
-      <div class="acoes-topo">
-        <div class="hora-box" id="ritmo-topo">Ritmo: --</div>
-        <div class="hora-box" id="varredura-topo">Varredura: --:--:--</div>
-        <div class="hora-box" id="hora-topo">Hora: --:--:--</div>
-        <button class="btn-varrer" id="btn-varrer" onclick="forcarVarredura()">Varrer Agora</button>
+      <div class="title"><span class="dot"></span> Robo2 Signals — Monitor Autônomo (v{APP_VERSION})</div>
+      <div class="meta-bar">
+        <span class="pill">Ritmo: <strong>{state.get('rhythm_mode')}</strong></span>
+        <span class="pill">Última varredura: <strong>{state.get('last_scan_at') or '--:--:--'}</strong></span>
+        <span class="pill">Hora: <strong id="clockNow">--:--:--</strong></span>
+        <button class="btn" onclick="scanNow()">Varrer Agora</button>
       </div>
     </div>
 
-    <div class="cards">
+    <div class="grid-5">
       <div class="card">
-        <div class="rotulo">Saldo Phantom (USDC)</div>
-        <div class="valor verde" id="saldo">$0.00</div>
-        <div class="sub">Solana • Carteira ativa</div>
+        <div class="card-label">Saldo Phantom (USDC)</div>
+        <div class="card-val green">${state.get('phantom_usdc_balance', 0.0):.2f}</div>
+        <div class="card-sub">Solana • Carteira ativa</div>
       </div>
       <div class="card">
-        <div class="rotulo">Operações Aprovadas</div>
-        <div class="valor verde" id="entradas">$0.00</div>
-        <div class="sub" id="qtd-vendas">0 vendas aprovadas</div>
+        <div class="card-label">Operações Aprovadas</div>
+        <div class="card-val green">${state.get('approved_sales_usdc', 0.0):.2f}</div>
+        <div class="card-sub">{state.get('approved_sales_count', 0)} vendas aprovadas</div>
       </div>
       <div class="card">
-        <div class="rotulo">Cobranças 402</div>
-        <div class="valor amarelo" id="cobrancas">0</div>
-        <div class="sub">Pedidos x402</div>
+        <div class="card-label">Cobranças 402</div>
+        <div class="card-val amber">{state.get('x402_charges_count', 0)}</div>
+        <div class="card-sub">Pedidos x402</div>
       </div>
       <div class="card">
-        <div class="rotulo">Chamadas Totais</div>
-        <div class="valor roxo" id="chamadas">0</div>
-        <div class="sub" id="fissuras-sub">0 fissuras • 0 hooks</div>
+        <div class="card-label">Chamadas Totais</div>
+        <div class="card-val blue">{state.get('total_calls', 0)}</div>
+        <div class="card-sub">{state.get('fissures_count', 0)} fissuras • {state.get('hooks_triggered_count', 0)} hooks</div>
       </div>
       <div class="card">
-        <div class="rotulo">Sinais Coletados</div>
-        <div class="valor azul" id="saidas">0</div>
-        <div class="sub">Economia + Multi-Redes</div>
+        <div class="card-label">Sinais Coletados</div>
+        <div class="card-val blue">{state.get('signals_collected_count', 0)}</div>
+        <div class="card-sub">Economia + Multi-Redes</div>
       </div>
     </div>
 
-    <div class="caixa">
-      <div class="caixa-topo">
-        <h2>Movimento por Hora</h2>
-        <div class="legenda">
-          <span><i class="quad b-402"></i>Cobranças</span>
-          <span><i class="quad b-saida"></i>Sinais/Saídas</span>
-          <span><i class="quad b-entrada"></i>Aprovadas (USDC)</span>
-        </div>
+    <div class="section">
+      <div class="sec-title"><span>Webhook Autônomo de Saída (Agentes / Clientes)</span><span>{active_hooks} ativos</span></div>
+      <div class="hook-row">
+        <input id="agentId" class="inp" placeholder="ID do agente/cliente" />
+        <input id="webhookUrl" class="inp" placeholder="https://endpoint-do-cliente/webhook" />
+        <button class="btn-blue" onclick="activateWebhook()">Ativar Webhook</button>
       </div>
-      <div class="grafico" id="grafico">
-        <div class="vazio" style="width:100%">Sem movimentação por hora ainda.</div>
-      </div>
+      <div class="card-sub" style="margin-top:8px;">Envia automaticamente o alerta e o caminho de pagamento x402 quando surge fissura crítica ou oportunidade.</div>
     </div>
 
-    <div class="caixa">
-      <div class="caixa-topo">
-        <h2>Webhook Autônomo de Saída (Agentes / Clientes)</h2>
-        <span class="sub" id="hooks-ativos-lbl">0 ativos</span>
-      </div>
-      <div class="hook-form">
-        <input class="hook-input curto" id="hook-cliente" type="text" placeholder="ID do agente/cliente" />
-        <input class="hook-input" id="hook-url" type="url" placeholder="https://endpoint-do-cliente/webhook" />
-        <button class="btn-hook" onclick="cadastrarWebhook()">Ativar Webhook</button>
-      </div>
-      <div class="hook-msg" id="hook-msg">Envia automaticamente o alerta e o caminho de pagamento x402 quando surge fissura crítica ou oportunidade.</div>
-      <div class="hook-lista" id="hook-lista"></div>
-    </div>
-
-    <div class="caixa">
-      <div class="caixa-topo">
-        <div>
-          <h2>Operações Aprovadas & Chamadas em Tempo Real</h2>
-          <span class="sub" id="status-sync">Atualiza a cada 3s</span>
-        </div>
-        <div class="filtros">
-          <button class="filtro-btn ativo" onclick="mudarFiltro('todos', this)">Todas</button>
-          <button class="filtro-btn" onclick="mudarFiltro('aprovada', this)">Aprovadas</button>
-          <button class="filtro-btn" onclick="mudarFiltro('402', this)">Cobranças 402</button>
-          <button class="filtro-btn" onclick="mudarFiltro('chamadas', this)">Chamadas & Varreduras</button>
-        </div>
-      </div>
+    <div class="section">
+      <div class="sec-title"><span>Operações Aprovadas & Chamadas em Tempo Real</span><span id="hourlyBadge"></span></div>
       <table>
         <thead>
-          <tr>
-            <th>Hora</th>
-            <th>Status / Tipo</th>
-            <th>Operação / Chamada</th>
-            <th>Valor</th>
-          </tr>
+          <tr><th>Hora</th><th>Status / Tipo</th><th>Operação / Chamada</th><th>Valor</th></tr>
         </thead>
-        <tbody id="lista">
-          <tr><td colspan="4" class="vazio">Carregando operações e chamadas...</td></tr>
-        </tbody>
+        <tbody>{rows_html}</tbody>
       </table>
     </div>
   </div>
 
   <script>
-    let filtroAtual = 'todos';
-    let eventosCache = [];
+    const hourlyData = {hourly_json};
+    function tickClock() {{
+      const d = new Date();
+      document.getElementById("clockNow").textContent = d.toTimeString().slice(0, 8);
+      const hk = d.toTimeString().slice(0, 2) + ":00";
+      const b = hourlyData[hk] || {{ charges: 0, signals: 0, approved_usdc: 0 }};
+      document.getElementById("hourlyBadge").textContent =
+        `Hora ${{hk}}: ${{b.charges}} cobranças • ${{b.signals}} sinais • $${Number(b.approved_usdc || 0).toFixed(2)} USDC`;
+    }}
+    setInterval(tickClock, 1000);
+    tickClock();
 
-    function mudarFiltro(novoFiltro, botao) {
-      filtroAtual = novoFiltro;
-      document.querySelectorAll('.filtro-btn').forEach(b => b.classList.remove('ativo'));
-      botao.classList.add('ativo');
-      renderizarTabela();
-    }
+    async function scanNow() {{
+      await fetch("/varrer", {{ method: "POST" }});
+      location.reload();
+    }}
 
-    function renderizarTabela() {
-      const tb = document.getElementById('lista');
-      const filtrados = eventosCache.filter(ev => {
-        if (filtroAtual === 'todos') return true;
-        if (filtroAtual === 'aprovada') return ev.status === 'aprovada' || ev.status === 'entrada';
-        if (filtroAtual === '402') return ev.status === '402';
-        if (filtroAtual === 'chamadas') return ev.status === 'chamada' || ev.status === 'saida' || ev.status === 'erro';
-        return true;
-      });
-
-      if (!filtrados || filtrados.length === 0) {
-        tb.innerHTML = '<tr><td colspan="4" class="vazio">Nenhum registro neste filtro ainda.</td></tr>';
-        return;
-      }
-
-      tb.innerHTML = filtrados.map(ev => {
-        let cls = 'p-chamada';
-        if (ev.status === 'aprovada' || ev.status === 'entrada') cls = 'p-aprovada';
-        else if (ev.status === '402') cls = 'p-402';
-        else if (ev.status === 'erro') cls = 'p-erro';
-
-        const val = ev.valor_usdc > 0 && (ev.status === 'aprovada' || ev.status === 'entrada')
-          ? '+$' + Number(ev.valor_usdc).toFixed(2) + ' USDC'
-          : (ev.valor_usdc > 0 ? ev.valor_usdc + ' itens' : '—');
-        const corVal = (ev.status === 'aprovada' || ev.status === 'entrada') ? '#3fb950' : '#8b949e';
-
-        return `<tr>
-          <td>${ev.hora}</td>
-          <td><span class="pill ${cls}">${ev.tipo}</span></td>
-          <td>${ev.detalhe}</td>
-          <td style="font-weight:600; color:${corVal}">${val}</td>
-        </tr>`;
-      }).join('');
-    }
-
-    async function cadastrarWebhook() {
-      const inpUrl = document.getElementById('hook-url');
-      const inpCli = document.getElementById('hook-cliente');
-      const msg = document.getElementById('hook-msg');
-      const url = inpUrl.value.trim();
-      const cliente_id = inpCli.value.trim() || null;
-      if (!url) {
-        msg.textContent = 'Informe uma URL http:// ou https:// do agente/cliente.';
-        return;
-      }
-      try {
-        const r = await fetch('/webhooks/registrar', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, cliente_id, gravidades: ['critico', 'oportunidade'] })
-        });
-        const j = await r.json();
-        if (r.ok) {
-          msg.textContent = 'Webhook ativo (' + j.status + ') para ' + (j.webhook.cliente_id || '') + ': ' + url;
-          inpUrl.value = '';
-          inpCli.value = '';
-          await carregar();
-        } else {
-          msg.textContent = 'Erro: ' + (j.erro || 'URL inválida');
-        }
-      } catch (e) {
-        msg.textContent = 'Falha ao salvar webhook.';
-      }
-    }
-
-    async function removerWebhook(url) {
-      await fetch('/webhooks?url=' + encodeURIComponent(url), { method: 'DELETE' });
-      await carregar();
-    }
-
-    async function forcarVarredura() {
-      const btn = document.getElementById('btn-varrer');
-      btn.disabled = true;
-      btn.textContent = 'Varrendo...';
-      try {
-        await fetch('/api/varrer-agora', { method: 'POST' });
-        await carregar();
-      } finally {
-        btn.disabled = false;
-        btn.textContent = 'Varrer Agora';
-      }
-    }
-
-    async function carregar() {
-      try {
-        const r = await fetch('/api/metricas');
-        const d = await r.json();
-
-        document.getElementById('ritmo-topo').textContent = 'Ritmo: ' + (d.estrategia_ritmo || '--') + ' (' + (d.proximo_intervalo_seg || '--') + 's)';
-        document.getElementById('hora-topo').textContent = 'Hora: ' + d.hora_agora;
-        document.getElementById('varredura-topo').textContent = 'Última varredura: ' + d.ultima_varredura;
-        document.getElementById('saldo').textContent = '$' + Number(d.saldo_usdc).toFixed(2);
-        document.getElementById('entradas').textContent = '$' + Number(d.receita_sessao_usdc).toFixed(2);
-        document.getElementById('qtd-vendas').textContent = d.vendas_pagas + ' vendas aprovadas';
-        document.getElementById('cobrancas').textContent = d.cobrancas_402;
-        document.getElementById('chamadas').textContent = d.total_chamadas || 0;
-        document.getElementById('fissuras-sub').textContent = (d.fissuras_ativas || 0) + ' fissuras • ' + (d.total_webhooks_enviados || 0) + ' hooks';
-        document.getElementById('hooks-ativos-lbl').textContent = (d.webhooks_ativos || 0) + ' ativos';
-        document.getElementById('saidas').textContent = d.itens_entregues;
-        document.getElementById('status-sync').textContent = 'Sincronizado às ' + d.hora_agora;
-
-        const hl = document.getElementById('hook-lista');
-        const hooks = d.webhooks_lista || [];
-        hl.innerHTML = hooks.map(h => {
-          const st = h.ativo !== false ? '<span style="color:#3fb950">● ativo</span>' : '<span style="color:#f85149">● pausado</span>';
-          return `<div class="hook-item">
-            <div>${st} <strong>${h.cliente_id || 'agente'}</strong> • ${h.url} <span style="color:#8b949e">(${h.envios_ok || 0} envios)</span></div>
-            <button class="btn-rem" onclick="removerWebhook('${h.url}')">Remover</button>
-          </div>`;
-        }).join('');
-
-        const g = document.getElementById('grafico');
-        if (d.grafico_horas && d.grafico_horas.length > 0) {
-          const maxVal = Math.max(1, ...d.grafico_horas.map(h => Math.max(h.cobrancas, h.saidas_itens, h.entradas_usdc * 100)));
-          g.innerHTML = d.grafico_horas.map(h => {
-            const h402 = Math.max(4, Math.round((h.cobrancas / maxVal) * 100));
-            const hSai = Math.max(4, Math.round((h.saidas_itens / maxVal) * 100));
-            const hEnt = Math.max(4, Math.round(((h.entradas_usdc * 100) / maxVal) * 100));
-            return `<div class="coluna-grupo">
-              <div class="barras">
-                <div class="barra b-402" style="height:${h402}px" title="Cobranças: ${h.cobrancas}"></div>
-                <div class="barra b-saida" style="height:${hSai}px" title="Saídas/Sinais: ${h.saidas_itens}"></div>
-                <div class="barra b-entrada" style="height:${hEnt}px" title="Aprovadas: $${h.entradas_usdc}"></div>
-              </div>
-              <div class="hora-lbl">${h.hora}</div>
-            </div>`;
-          }).join('');
-        }
-
-        eventosCache = d.eventos || [];
-        renderizarTabela();
-      } catch (e) {
-        document.getElementById('status-sync').textContent = 'Reconectando...';
-      }
-    }
-
-    carregar();
-    setInterval(carregar, 3000);
+    async function activateWebhook() {{
+      const agent_id = document.getElementById("agentId").value.trim();
+      const webhook_url = document.getElementById("webhookUrl").value.trim();
+      if (!agent_id || !webhook_url) return alert("Preencha o ID do agente e a URL do webhook.");
+      const res = await fetch("/webhooks", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ agent_id, webhook_url }})
+      }});
+      if (res.ok) location.reload();
+      else alert("Erro ao ativar webhook.");
+    }}
   </script>
 </body>
-</html>"""
+</html>
+"""
 
 
-@app.get("/.well-known/x402")
-def well_known_x402(request: Request):
-    registrar_evento("CHAMADA /.well-known/x402", "Descoberta de protocolo x402 por agente", 0.0, "chamada")
-    base = str(request.base_url).rstrip("/")
-    return {
-        "version": 1,
-        "provider": "Robo2 Signals API",
-        "network": REDE_PAGAMENTO,
-        "currency": MOEDA_PAGAMENTO,
-        "payTo": PAY_TO_ADDRESS,
-        "endpoints": [
-            {
-                "path": "/radar/itens",
-                "method": "GET",
-                "priceUSDC": f"{PRECO_USDC:.2f}",
-                "description": "Manchetes Economia/Tech + Cotações CEX/DEX Multi-Redes + Fissuras."
-            },
-            {
-                "path": "/webhooks/registrar",
-                "method": "POST",
-                "priceUSDC": "0.00",
-                "description": "Assina notificações push autônomas de fissuras críticas e oportunidades."
-            }
-        ],
-        "openapi": f"{base}/openapi.json"
-    }
-
-
-@app.get("/.well-known/agent.json")
-def well_known_agent(request: Request):
-    registrar_evento("CHAMADA /.well-known/agent.json", "Descoberta de agente autônomo", 0.0, "chamada")
-    base = str(request.base_url).rstrip("/")
-    return {
-        "name": "Robo2 Signals API",
-        "version": "2.9.0",
-        "autonomous_scanning": True,
-        "adaptive_rhythm": True,
-        "autonomous_webhooks": True,
-        "payment": {"protocol": "x402", "network": REDE_PAGAMENTO, "currency": MOEDA_PAGAMENTO, "payTo": PAY_TO_ADDRESS, "priceUSDC": PRECO_USDC},
-        "capabilities": ["macro_tech_news", "multichain_dex_prices", "fissure_detection", "adaptive_backoff", "autonomous_push_webhooks"],
-        "endpoints": {
-            "signals_paid": f"{base}/radar/itens",
-            "fissures": f"{base}/api/fissuras",
-            "webhook_subscribe": f"{base}/webhooks/registrar",
-            "webhooks_list": f"{base}/webhooks",
-            "openapi": f"{base}/openapi.json"
-        }
-    }
-
-
-@app.get("/.well-known/ai-plugin.json")
-def well_known_ai_plugin(request: Request):
-    registrar_evento("CHAMADA /ai-plugin.json", "Descoberta de manifest AI Plugin", 0.0, "chamada")
-    base = str(request.base_url).rstrip("/")
-    return {
-        "schema_version": "v1",
-        "name_for_human": "Robo2 Signals API",
-        "name_for_model": "robo2_signals",
-        "description_for_human": "Sinais de Economia, Tech e Redes Descentralizadas via x402 USDC com Ritmo Adaptativo e Webhooks Autônomos.",
-        "description_for_model": "Fetches structured economy, tech, decentralized crypto markets, and anomaly signals via GET /radar/itens with x402 USDC payment on Solana, and subscribes autonomous agents via POST /webhooks/registrar.",
-        "auth": {"type": "none"},
-        "api": {"type": "openapi", "url": f"{base}/openapi.json"}
-    }
-
-
-@app.get("/radar")
-def verificar_radar():
-    resultados = []
-    total_kb = 0
-    for alvo in TARGETS:
-        if alvo["url"].startswith("descentralizado://"):
-            cache_item = ESTADO_VIGILANCIA["cache_coleta"].get(alvo["id"])
-            resultados.append({
-                "id": alvo["id"],
-                "categoria": alvo["categoria"],
-                "status": "online" if cache_item else "aquecendo",
-                "itens_em_cache": cache_item["total_itens"] if cache_item else 0
-            })
-            continue
-        try:
-            req = urllib.request.Request(alvo["url"], headers={"User-Agent": "Mozilla/5.0 (compatible; Robo2-Signals-API/2.9)"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                conteudo = resp.read()
-                total_kb += max(1, len(conteudo) // 1024)
-                resultados.append({"id": alvo["id"], "categoria": alvo["categoria"], "status": "online", "bytes": len(conteudo)})
-        except Exception as e:
-            resultados.append({"id": alvo["id"], "categoria": alvo["categoria"], "status": "erro", "detalhe": str(e)})
-    registrar_evento("CHAMADA /radar", f"Checagem de {len(TARGETS)} fontes ({total_kb} KB)", total_kb, "chamada")
-    return {
-        "registrado_em": datetime.now(BRT).strftime("%Y-%m-%d %H:%M:%S"),
-        "ultima_varredura_proativa": ESTADO_VIGILANCIA["ultima_varredura_brt"],
-        "resultados": resultados
-    }
-
-
-@app.get("/radar/itens")
-def listar_itens_radar(
-    request: Request,
-    categoria: str | None = Query(default=None),
-    limite_por_fonte: int = Query(default=6, ge=1, le=20)
-):
-    comprovante = request.headers.get("X-PAYMENT") or request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("X-Payment-Proof")
-
-    if not comprovante:
-        METRICAS["total_cobrancas_402"] += 1
-        registrar_evento("COBRANÇA 402", f"Chamada em /radar/itens ({categoria or 'todas'})", 0.0, "402")
-        manifesto = montar_manifesto_x402(str(request.url))
-        header_b64 = base64.b64encode(json.dumps(manifesto).encode("utf-8")).decode("utf-8")
-        return JSONResponse(status_code=402, content=manifesto, headers={"PAYMENT-REQUIRED": header_b64})
-
-    pago_ok, detalhe_tx = validar_pagamento_solana_usdc(comprovante)
-    if not pago_ok:
-        registrar_evento("RECUSADA 402", f"/radar/itens • {detalhe_tx}", 0.0, "erro")
-        manifesto = montar_manifesto_x402(str(request.url))
-        manifesto["motivo_recusa"] = detalhe_tx
-        return JSONResponse(status_code=402, content=manifesto)
-
-    alvos = [t for t in TARGETS if not categoria or t["categoria"].lower() == categoria.lower()]
-    coleta = []
-    total_geral = 0
-
-    for alvo in alvos:
-        try:
-            itens = extrair_itens_feed(alvo["url"], limite=limite_por_fonte)
-            total_geral += len(itens)
-            coleta.append({
-                "id": alvo["id"],
-                "fonte": alvo["fonte"],
-                "categoria": alvo["categoria"],
-                "status": "online",
-                "total_itens": len(itens),
-                "itens": itens
-            })
-        except Exception as e:
-            cache_fb = ESTADO_VIGILANCIA["cache_coleta"].get(alvo["id"])
-            if cache_fb:
-                itens_fb = cache_fb["itens"][:limite_por_fonte]
-                total_geral += len(itens_fb)
-                coleta.append({
-                    "id": alvo["id"],
-                    "fonte": alvo["fonte"],
-                    "categoria": alvo["categoria"],
-                    "status": "cache_contingencia",
-                    "total_itens": len(itens_fb),
-                    "itens": itens_fb
-                })
-            else:
-                coleta.append({
-                    "id": alvo["id"],
-                    "fonte": alvo["fonte"],
-                    "categoria": alvo["categoria"],
-                    "status": "erro",
-                    "detalhe": str(e),
-                    "total_itens": 0,
-                    "itens": []
-                })
-
-    coleta.sort(key=lambda x: x.get("total_itens", 0), reverse=True)
-    METRICAS["total_vendas_pagas"] += 1
-    METRICAS["receita_sessao_usdc"] += PRECO_USDC
-    METRICAS["total_itens_entregues"] += total_geral
-
-    registrar_evento(
-        "OPERAÇÃO APROVADA",
-        f"Entrega de {total_geral} sinais ({categoria or 'todas'}) • {detalhe_tx}",
-        PRECO_USDC,
-        "aprovada"
-    )
-
-    return JSONResponse(
-        status_code=200,
-        headers={"X-PAYMENT-RESPONSE": detalhe_tx},
-        content={
-            "registrado_em": datetime.now(BRT).isoformat(),
-            "pagamento_validado": detalhe_tx,
-            "filtro_categoria": categoria or "todas",
-            "total_itens_retornados": total_geral,
-            "fissuras_recentes": list(ESTADO_VIGILANCIA["fissuras_ativas"])[:5],
-            "fontes": coleta
-        }
-    )
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/painel", response_class=HTMLResponse, include_in_schema=False)
+async def painel() -> HTMLResponse:
+    async with STATE_LOCK:
+        return HTMLResponse(content=_render_dashboard_html(STATE))
