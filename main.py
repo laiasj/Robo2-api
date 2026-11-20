@@ -1,741 +1,303 @@
-import asyncio
-import json
 import os
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List
-
+import asyncio
 import httpx
-from fastapi import FastAPI, Query, Request
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
+from web3 import Web3
+from dotenv import load_dotenv
 
-# ==============================================================================
-# CONFIGURAÇÃO GERAL - ROBO2 SIGNALS (v2.10.0)
-# ==============================================================================
-APP_VERSION = "2.10.0"
-SERVICE_NAME = "Robo2 Signals - Monitor Autônomo"
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://robo2-api.onrender.com").rstrip("/")
+load_dotenv()
 
-# Cobrança máquina-a-máquina via x402 (USDC na rede Solana)
-SOLANA_PAY_TO = os.getenv("SOLANA_PAY_TO", "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk")
-PRICE_USDC = os.getenv("PRICE_USDC", "0.01")
-USDC_SOLANA_MINT = os.getenv(
-    "USDC_SOLANA_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-)
+# =====================================================================
+# 1. CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE (RENDER)
+# =====================================================================
+RECEIVER_WALLET = os.getenv("RECEIVER_WALLET", "0xSuaCarteiraAqui").lower()
+RPC_URL = os.getenv("RPC_URL", "https://mainnet.base.org")
+COLLECT_INTERVAL_SECONDS = int(os.getenv("COLLECT_INTERVAL_SECONDS", "30"))
+TRACKED_ASSETS = os.getenv("TRACKED_ASSETS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
 
-# Ritmo adaptativo e proteção contra erro 429
-BASE_SCAN_INTERVAL_SEC = int(os.getenv("BASE_SCAN_INTERVAL_SEC", "60"))
-RATE_LIMIT_COOLDOWN_SEC = int(os.getenv("RATE_LIMIT_COOLDOWN_SEC", "360"))
-AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
-
-# Persistência em disco (se houver disco no Render em /var/data, usa lá; senão usa ./data)
-DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data" if Path("/var/data").exists() else "./data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "robo2_state_v210.json"
-
-# Fontes configuradas para varredura
-FEEDS = [
-    {"id": "econ_cnbc", "name": "CNBC Markets", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
-    {"id": "econ_reuters", "name": "Reuters Business", "url": "https://feeds.reuters.com/reuters/businessNews"},
-    {"id": "crypto_coindesk", "name": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
-    {"id": "dex_trending", "name": "DexScreener Pairs", "url": "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112"},
-    {"id": "macro_fed", "name": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories"},
-    {"id": "tech_status", "name": "Tech & Infrastructure", "url": "https://feeds.arstechnica.com/arstechnica/index"},
-]
-
-app = FastAPI(title=SERVICE_NAME, version=APP_VERSION)
-
-
-# ==============================================================================
-# MODELOS DE ENTRADA
-# ==============================================================================
-class WebhookCreateRequest(BaseModel):
-    agent_id: str = Field(..., min_length=1, max_length=120)
-    webhook_url: str = Field(..., min_length=8, max_length=500)
-
-
-# ==============================================================================
-# ESTADO PERSISTENTE EM DISCO
-# ==============================================================================
-def _default_state() -> Dict[str, Any]:
-    return {
-        "version": APP_VERSION,
-        "phantom_usdc_balance": 0.0,
-        "approved_sales_usdc": 0.0,
-        "approved_sales_count": 0,
-        "x402_charges_count": 0,
-        "total_calls": 3,
-        "fissures_count": 1,
-        "hooks_triggered_count": 0,
-        "signals_collected_count": 0,
-        "rhythm_mode": "NORMAL",
-        "cooldown_remaining_sec": 0,
-        "last_scan_at": None,
-        "next_scan_at": None,
-        "webhooks": [],
-        "signals": [
-            {
-                "id": "init-1",
-                "source": "econ_cnbc",
-                "title": "Manchete relevante: Monitoramento de fissuras e catalisadores ativos",
-                "kind": "FISSURA • OPORTUNIDADE",
-                "value_label": "27 itens",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        ],
-        "activity_log": [
-            {
-                "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                "type": "CHAMADA",
-                "detail": "Consulta de status da API",
-                "value": "-",
-            }
-        ],
-        "hourly_stats": {},
+# Tokens com liquidez real aceitos no pagamento M2M (Rede Base Mainnet)
+ACCEPTED_TOKENS = {
+    "USDC": {
+        "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".lower(),
+        "decimals": 6,
+        "min_amount": float(os.getenv("PRICE_USDC", "0.01"))
+    },
+    "LINK": {
+        "address": "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196".lower(),
+        "decimals": 18,
+        "min_amount": float(os.getenv("PRICE_LINK", "0.0005"))
     }
+}
+
+# =====================================================================
+# 2. ESTADO EM MEMÓRIA DO ROBO2 & CONEXÃO BLOCKCHAIN
+# =====================================================================
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
+TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)").hex().lower()
+USED_TX_HASHES = set()
+
+ROBO2_STATE = {
+    "status": "starting",
+    "last_update": 0,
+    "total_paid_requests": 0,
+    "revenue_by_token": {"USDC": 0.0, "LINK": 0.0},
+    "signals": {},
+    "recent_settlements": []
+}
 
 
-def load_state() -> Dict[str, Any]:
-    if not STATE_FILE.exists():
-        st = _default_state()
-        save_state(st)
-        return st
+# =====================================================================
+# 3. MOTOR DE COLETA EM SEGUNDO PLANO (HOOK / SCHEDULER DO ROBO2)
+# =====================================================================
+async def fetch_market_snapshot(client: httpx.AsyncClient, symbol: str) -> dict | None:
+    """Coleta dados brutos e calcula spread/preço médio padronizado."""
+    clean_symbol = symbol.strip().upper()
+    url = f"https://api.binance.com/api/v3/ticker/bookTicker?symbol={clean_symbol}"
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        base = _default_state()
-        base.update(data)
-        base["version"] = APP_VERSION
-        return base
+        resp = await client.get(url, timeout=5.0)
+        if resp.status_code != 200:
+            return None
+        raw = resp.json()
+        bid = float(raw["bidPrice"])
+        ask = float(raw["askPrice"])
+        mid = round((bid + ask) / 2, 6)
+        spread_pct = round(((ask - bid) / bid) * 100, 5) if bid > 0 else 0.0
+
+        return {
+            "provider": "Robo2-M2M",
+            "asset": clean_symbol,
+            "value": mid,
+            "bid": bid,
+            "ask": ask,
+            "spread_pct": spread_pct,
+            "timestamp": int(time.time()),
+            "status": "verified"
+        }
     except Exception:
-        return _default_state()
+        return None
 
 
-def save_state(state: Dict[str, Any]) -> None:
-    tmp_file = STATE_FILE.with_suffix(".tmp")
-    tmp_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_file.replace(STATE_FILE)
+async def background_collector_loop():
+    """Mantém o cache do Robo2 sempre quente para entrega imediata aos agentes."""
+    async with httpx.AsyncClient() as client:
+        while True:
+            for asset in TRACKED_ASSETS:
+                signal = await fetch_market_snapshot(client, asset)
+                if signal:
+                    ROBO2_STATE["signals"][signal["asset"]] = signal
+            ROBO2_STATE["status"] = "online"
+            ROBO2_STATE["last_update"] = int(time.time())
+            await asyncio.sleep(COLLECT_INTERVAL_SECONDS)
 
 
-STATE_LOCK = asyncio.Lock()
-STATE: Dict[str, Any] = load_state()
-COOLDOWN_UNTIL_TS: float = 0.0
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(background_collector_loop())
+    yield
+    task.cancel()
 
 
-def _bump_hourly(state: Dict[str, Any], field: str, amount: float = 1.0) -> None:
-    hour_key = datetime.now().strftime("%H:00")
-    bucket = state["hourly_stats"].setdefault(
-        hour_key, {"charges": 0, "signals": 0, "approved_usdc": 0.0}
-    )
-    bucket[field] = bucket.get(field, 0) + amount
+app = FastAPI(title="Robo2 M2M Oracle & Payment Gateway", version="2.0.0", lifespan=lifespan)
 
 
-def _push_log(state: Dict[str, Any], log_type: str, detail: str, value: str = "-") -> None:
-    state["activity_log"].insert(
-        0,
-        {
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "type": log_type,
-            "detail": detail,
-            "value": value,
-        },
-    )
-    state["activity_log"] = state["activity_log"][:120]
+# =====================================================================
+# 4. VALIDAÇÃO DE PAGAMENTO ON-CHAIN (USDC x402 + TOKEN LÍQUIDO)
+# =====================================================================
+def verify_onchain_payment(tx_hash: str) -> dict:
+    if not tx_hash:
+        return {"valid": False, "reason": "Header de pagamento ausente"}
+
+    tx_clean = tx_hash.strip().lower()
+    if tx_clean in USED_TX_HASHES:
+        return {"valid": False, "reason": "Hash de transação já utilizado"}
+
+    try:
+        receipt = w3.eth.get_transaction_receipt(tx_clean)
+        if not receipt or receipt.status != 1:
+            return {"valid": False, "reason": "Transação não confirmada ou falhou na rede"}
+
+        for log in receipt.logs:
+            topics = [t.hex().lower() for t in log.topics]
+            if len(topics) >= 3 and topics[0] == TRANSFER_TOPIC:
+                to_addr = "0x" + topics[2][-40:]
+                if to_addr.lower() == RECEIVER_WALLET:
+                    contract_addr = log.address.lower()
+                    for symbol, info in ACCEPTED_TOKENS.items():
+                        if contract_addr == info["address"]:
+                            raw_val = int(log.data.hex(), 16)
+                            amount = raw_val / (10 ** info["decimals"])
+                            if amount >= info["min_amount"]:
+                                USED_TX_HASHES.add(tx_clean)
+                                ROBO2_STATE["total_paid_requests"] += 1
+                                ROBO2_STATE["revenue_by_token"][symbol] = round(
+                                    ROBO2_STATE["revenue_by_token"].get(symbol, 0.0) + amount, 6
+                                )
+                                ROBO2_STATE["recent_settlements"].insert(0, {
+                                    "token": symbol,
+                                    "amount": amount,
+                                    "tx": tx_clean,
+                                    "time": int(time.time())
+                                })
+                                ROBO2_STATE["recent_settlements"] = ROBO2_STATE["recent_settlements"][:20]
+                                return {"valid": True, "token": symbol, "amount": amount, "tx": tx_clean}
+
+        return {"valid": False, "reason": "Valor abaixo do mínimo ou token não aceito"}
+    except Exception as e:
+        return {"valid": False, "reason": f"Erro na verificação RPC: {str(e)}"}
 
 
-def _refresh_rhythm(state: Dict[str, Any]) -> None:
-    now = time.time()
-    if COOLDOWN_UNTIL_TS > now:
-        rem = int(round(COOLDOWN_UNTIL_TS - now))
-        state["rhythm_mode"] = f"RESFRIANDO (429) ({RATE_LIMIT_COOLDOWN_SEC}s)"
-        state["cooldown_remaining_sec"] = rem
-    else:
-        state["rhythm_mode"] = "ATIVO (ADAPTATIVO)"
-        state["cooldown_remaining_sec"] = 0
+# =====================================================================
+# 5. PAINEL DE CONTROLE WEB & DESCOBERTA DE PROTOCOLO
+# =====================================================================
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    signals_rows = "".join(
+        f"<tr><td><b>{k}</b></td><td>{v['value']}</td><td>{v['bid']}</td><td>{v['ask']}</td><td>{v['spread_pct']}%</td><td>{v['timestamp']}</td></tr>"
+        for k, v in ROBO2_STATE["signals"].items()
+    ) or "<tr><td colspan='6'>Coletando primeiros sinais...</td></tr>"
+
+    settlements_rows = "".join(
+        f"<tr><td>{s['token']}</td><td>{s['amount']}</td><td>{s['tx'][:18]}...</td><td>{s['time']}</td></tr>"
+        for s in ROBO2_STATE["recent_settlements"]
+    ) or "<tr><td colspan='4'>Nenhum pagamento M2M registrado ainda.</td></tr>"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta http-equiv="refresh" content="15">
+        <title>Robo2 M2M Gateway</title>
+        <style>
+            body {{ font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 2rem; }}
+            .card {{ background: #1e293b; padding: 1.5rem; border-radius: 10px; margin-bottom: 1.5rem; }}
+            h1, h2 {{ margin-top: 0; color: #38bdf8; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 0.5rem; }}
+            th, td {{ text-align: left; padding: 0.6rem; border-bottom: 1px solid #334155; }}
+            .badge {{ background: #10b981; color: #052e16; padding: 0.25rem 0.6rem; border-radius: 6px; font-weight: bold; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>Robo2 — Painel M2M & Oráculo <span class="badge">{ROBO2_STATE['status'].upper()}</span></h1>
+            <p><b>Carteira Recebedora:</b> {RECEIVER_WALLET}</p>
+            <p><b>Requisições Pagas:</b> {ROBO2_STATE['total_paid_requests']} |
+               <b>Receita USDC:</b> {ROBO2_STATE['revenue_by_token']['USDC']} |
+               <b>Receita LINK:</b> {ROBO2_STATE['revenue_by_token']['LINK']}</p>
+            <p><b>Endpoint M2M:</b> <code>GET /api/v1/m2m/feed/{{ASSET}}</code> (Header: <code>X-Payment-Tx</code>)</p>
+        </div>
+
+        <div class="card">
+            <h2>Sinais Ativos em Cache</h2>
+            <table>
+                <thead><tr><th>Ativo</th><th>Preço Médio</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Timestamp</th></tr></thead>
+                <tbody>{signals_rows}</tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Últimas Liquidações M2M</h2>
+            <table>
+                <thead><tr><th>Token</th><th>Valor</th><th>Tx Hash</th><th>Timestamp</th></tr></thead>
+                <tbody>{settlements_rows}</tbody>
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 
-# ==============================================================================
-# MOTOR DE VARREDURA COM RITMO ADAPTATIVO (429) E WEBHOOKS AUTÔNOMOS
-# ==============================================================================
-async def dispatch_webhooks(state: Dict[str, Any], payload: Dict[str, Any]) -> int:
-    hooks = state.get("webhooks", [])
-    if not hooks:
-        return 0
-    sent = 0
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        for h in hooks:
-            if not h.get("active", True):
-                continue
-            try:
-                resp = await client.post(h["webhook_url"], json=payload)
-                if 200 <= resp.status_code < 300:
-                    sent += 1
-                    state["hooks_triggered_count"] = state.get("hooks_triggered_count", 0) + 1
-            except Exception:
-                continue
-    return sent
+@app.get("/health")
+async def health():
+    return {
+        "status": ROBO2_STATE["status"],
+        "last_update": ROBO2_STATE["last_update"],
+        "assets_cached": list(ROBO2_STATE["signals"].keys())
+    }
 
 
-async def run_scan_cycle(force: bool = False) -> Dict[str, Any]:
-    global COOLDOWN_UNTIL_TS
-    async with STATE_LOCK:
-        now = time.time()
-        if not force and COOLDOWN_UNTIL_TS > now:
-            _refresh_rhythm(STATE)
-            save_state(STATE)
-            return {
-                "status": "cooling_down",
-                "cooldown_remaining_sec": STATE["cooldown_remaining_sec"],
-            }
-
-        hit_429 = False
-        collected_items: List[Dict[str, Any]] = []
-        sources_checked = 0
-
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            headers={"User-Agent": f"Robo2Signals/{APP_VERSION} (+{PUBLIC_BASE_URL})"},
-        ) as client:
-            for feed in FEEDS:
-                sources_checked += 1
-                try:
-                    r = await client.get(feed["url"])
-                    if r.status_code == 429:
-                        hit_429 = True
-                        break
-                    if r.status_code == 200:
-                        text = r.text
-                        snippet = text.strip().replace("\n", " ")[:180]
-                        item = {
-                            "id": f"{feed['id']}-{int(now * 1000)}",
-                            "source": feed["id"],
-                            "source_name": feed["name"],
-                            "title": f"[{feed['id']}] Sinal capturado: {snippet}",
-                            "kind": "FISSURA • OPORTUNIDADE" if "429" not in snippet else "SINAL",
-                            "value_label": "1 item",
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        }
-                        collected_items.append(item)
-                except httpx.HTTPStatusError as exc:
-                    if exc.response is not None and exc.response.status_code == 429:
-                        hit_429 = True
-                        break
-                except Exception:
-                    continue
-
-        now_iso = datetime.now().strftime("%H:%M:%S")
-        STATE["last_scan_at"] = now_iso
-        STATE["total_calls"] = STATE.get("total_calls", 0) + 1
-
-        if hit_429:
-            COOLDOWN_UNTIL_TS = time.time() + RATE_LIMIT_COOLDOWN_SEC
-            _refresh_rhythm(STATE)
-            STATE["next_scan_at"] = datetime.fromtimestamp(COOLDOWN_UNTIL_TS).strftime("%H:%M:%S")
-            _push_log(
-                STATE,
-                "VARREDURA (AUTO)",
-                f"{sources_checked} fontes • rate limit 429 • próximo em {RATE_LIMIT_COOLDOWN_SEC}s ({STATE['rhythm_mode']})",
-                "429",
-            )
-            save_state(STATE)
-            return {
-                "status": "rate_limited_429",
-                "cooldown_sec": RATE_LIMIT_COOLDOWN_SEC,
-            }
-
-        COOLDOWN_UNTIL_TS = 0.0
-        _refresh_rhythm(STATE)
-        next_ts = time.time() + BASE_SCAN_INTERVAL_SEC
-        STATE["next_scan_at"] = datetime.fromtimestamp(next_ts).strftime("%H:%M:%S")
-
-        new_count = len(collected_items)
-        STATE["signals_collected_count"] = STATE.get("signals_collected_count", 0) + new_count
-        STATE["fissures_count"] = STATE.get("fissures_count", 0) + new_count
-        _bump_hourly(STATE, "signals", float(new_count))
-
-        for it in reversed(collected_items):
-            STATE["signals"].insert(0, it)
-        STATE["signals"] = STATE["signals"][:200]
-
-        _push_log(
-            STATE,
-            "VARREDURA (AUTO)",
-            f"{sources_checked} fontes • {new_count} sinais • próximo em {BASE_SCAN_INTERVAL_SEC}s ({STATE['rhythm_mode']})",
-            f"{new_count} itens",
-        )
-
-        if collected_items:
-            await dispatch_webhooks(
-                STATE,
-                {
-                    "version": APP_VERSION,
-                    "event": "signal.opportunity",
-                    "x402": {
-                        "protocol": "x402",
-                        "network": "solana",
-                        "asset": "USDC",
-                        "amount": PRICE_USDC,
-                        "pay_to": SOLANA_PAY_TO,
-                        "resource": f"{PUBLIC_BASE_URL}/radar/itens",
-                    },
-                    "items": collected_items[:10],
-                },
-            )
-
-        save_state(STATE)
-        return {"status": "ok", "sources_checked": sources_checked, "collected": new_count}
+@app.get("/.well-known/x402.json")
+async def x402_discovery():
+    """Manifesto legível por máquinas para descoberta automática de preço e tokens."""
+    return {
+        "protocol": "x402",
+        "version": "1.0",
+        "provider": "Robo2-M2M",
+        "network": "base-mainnet",
+        "receiver": RECEIVER_WALLET,
+        "endpoint_template": "/api/v1/m2m/feed/{asset}",
+        "payment_header": "X-Payment-Tx",
+        "accepted_tokens": ACCEPTED_TOKENS
+    }
 
 
-async def _background_scanner_loop() -> None:
-    while True:
-        try:
-            if AUTO_SCAN_ENABLED:
-                await run_scan_cycle(force=False)
-        except Exception:
-            pass
-        async with STATE_LOCK:
-            _refresh_rhythm(STATE)
-            rem = STATE.get("cooldown_remaining_sec", 0)
-        sleep_for = rem if rem > 0 else BASE_SCAN_INTERVAL_SEC
-        await asyncio.sleep(max(10, min(sleep_for, 600)))
+# =====================================================================
+# 6. ROTA PRINCIPAL M2M (PORTA DUPLA: USDC x402 + TOKEN NATIVO LÍQUIDO)
+# =====================================================================
+@app.get("/api/v1/m2m/feed/{asset}")
+async def get_m2m_feed(
+    asset: str,
+    x_payment_tx: str | None = Header(default=None, alias="X-Payment-Tx"),
+    x_payment: str | None = Header(default=None, alias="X-PAYMENT")
+):
+    proof = x_payment_tx or x_payment
 
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    async with STATE_LOCK:
-        _refresh_rhythm(STATE)
-        save_state(STATE)
-    asyncio.create_task(_background_scanner_loop())
-
-
-# ==============================================================================
-# MANIFESTOS DE AUTODESCOBERTA (B2B / BOT-TO-BOT / X402 / SOLANA)
-# ==============================================================================
-def _base_url_from_request(request: Request) -> str:
-    req_base = str(request.base_url).rstrip("/") if request.base_url else ""
-    return req_base or PUBLIC_BASE_URL
-
-
-@app.get("/.well-known/x402", tags=["discovery", "x402"])
-async def well_known_x402(request: Request) -> JSONResponse:
-    base_url = _base_url_from_request(request)
-    return JSONResponse(
-        content={
-            "x402Version": 1,
-            "name": SERVICE_NAME,
-            "version": APP_VERSION,
-            "autonomous_b2b": True,
-            "accepts": [
-                {
-                    "scheme": "exact",
-                    "network": "solana",
-                    "maxAmountRequired": PRICE_USDC,
-                    "asset": "USDC",
-                    "usdcMint": USDC_SOLANA_MINT,
-                    "payTo": SOLANA_PAY_TO,
-                    "resource": f"{base_url}/radar/itens",
-                    "description": "Acesso máquina-a-máquina aos sinais e fissuras detectadas em tempo real pelo Robo2.",
-                    "mimeType": "application/json",
-                }
-            ],
-            "endpoints": {
-                "data": f"{base_url}/radar/itens",
-                "agentManifest": f"{base_url}/.well-known/agent.json",
-                "pluginManifest": f"{base_url}/.well-known/ai-plugin.json",
-                "openapi": f"{base_url}/openapi.json",
-            },
-        }
-    )
-
-
-@app.get("/.well-known/agent.json", tags=["discovery", "agents"])
-async def well_known_agent_json(request: Request) -> JSONResponse:
-    base_url = _base_url_from_request(request)
-    return JSONResponse(
-        content={
-            "schema_version": "1.0",
-            "name": SERVICE_NAME,
-            "version": APP_VERSION,
-            "description": "Provedor autônomo de sinais e fissuras em tempo real com pagamento automático x402 em USDC na Solana.",
-            "url": base_url,
-            "capabilities": {
-                "bot_to_bot_monetization": True,
-                "autonomous_discovery": True,
-                "adaptive_rate_limit_429": True,
-                "autonomous_webhooks": True,
-            },
-            "payment": {
+    # Sem recibo: devolve HTTP 402 com contrato exato de USDC e LINK para pagamento automático
+    if not proof:
+        return JSONResponse(
+            status_code=402,
+            content={
+                "error": "Payment Required",
                 "protocol": "x402",
-                "network": "solana",
-                "asset": "USDC",
-                "usdc_mint": USDC_SOLANA_MINT,
-                "price_per_request": PRICE_USDC,
-                "pay_to": SOLANA_PAY_TO,
-                "target_endpoint": f"{base_url}/radar/itens",
-            },
-            "resources": [
-                {
-                    "path": "/radar/itens",
-                    "method": "GET",
-                    "payment_protocol": "x402",
-                    "summary": "Retorna sinais coletados e oportunidades/fissuras recentes.",
-                }
-            ],
-            "discovery": {
-                "x402": f"{base_url}/.well-known/x402",
-                "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
-                "openapi": f"{base_url}/openapi.json",
-            },
-        }
-    )
-
-
-@app.get("/.well-known/ai-plugin.json", tags=["discovery", "agents"])
-async def well_known_ai_plugin(request: Request) -> JSONResponse:
-    base_url = _base_url_from_request(request)
-    return JSONResponse(
-        content={
-            "schema_version": "v1",
-            "name_for_human": SERVICE_NAME,
-            "name_for_model": "robo2_signals_x402",
-            "description_for_human": "Sinais e fissuras em tempo real com cobrança automática em USDC na Solana via x402.",
-            "description_for_model": (
-                f"API de sinais ({APP_VERSION}) para consumo máquina-a-máquina. "
-                f"Requer pagamento x402 em USDC (Solana) para acessar {base_url}/radar/itens."
-            ),
-            "auth": {
-                "type": "x402",
-                "network": "solana",
-                "asset": "USDC",
-                "pay_to": SOLANA_PAY_TO,
-            },
-            "api": {"type": "openapi", "url": f"{base_url}/openapi.json"},
-            "logo_url": f"{base_url}/static/logo.png",
-            "contact_email": "contato@lentenoir.com",
-            "legal_info_url": base_url,
-        }
-    )
-
-
-# ==============================================================================
-# ROTAS DE DADOS (X402), WEBHOOKS AUTÔNOMOS E VARREDURA
-# ==============================================================================
-@app.get("/radar/itens", tags=["signals", "x402"])
-async def radar_itens(
-    request: Request,
-    limit: int = Query(default=25, ge=1, le=100),
-) -> JSONResponse:
-    base_url = _base_url_from_request(request)
-    payment_proof = (
-        request.headers.get("x-payment")
-        or request.headers.get("x-402-payment")
-        or request.headers.get("authorization")
-    )
-
-    async with STATE_LOCK:
-        _refresh_rhythm(STATE)
-        STATE["total_calls"] = STATE.get("total_calls", 0) + 1
-
-        if not payment_proof:
-            STATE["x402_charges_count"] = STATE.get("x402_charges_count", 0) + 1
-            _bump_hourly(STATE, "charges", 1.0)
-            _push_log(
-                STATE,
-                "COBRANÇA 402",
-                f"Desafio x402 emitido para /radar/itens ({PRICE_USDC} USDC/Solana)",
-                f"{PRICE_USDC} USDC",
-            )
-            save_state(STATE)
-            return JSONResponse(
-                status_code=402,
-                headers={"X-Accept-Payment": "x402"},
-                content={
-                    "error": "Payment Required",
-                    "protocol": "x402",
-                    "version": APP_VERSION,
-                    "accepts": [
-                        {
-                            "scheme": "exact",
-                            "network": "solana",
-                            "maxAmountRequired": PRICE_USDC,
-                            "asset": "USDC",
-                            "usdcMint": USDC_SOLANA_MINT,
-                            "payTo": SOLANA_PAY_TO,
-                            "resource": f"{base_url}/radar/itens",
-                        }
-                    ],
-                },
-            )
-
-        try:
-            amount_val = float(PRICE_USDC)
-        except ValueError:
-            amount_val = 0.0
-
-        STATE["approved_sales_count"] = STATE.get("approved_sales_count", 0) + 1
-        STATE["approved_sales_usdc"] = round(
-            STATE.get("approved_sales_usdc", 0.0) + amount_val, 6
-        )
-        STATE["phantom_usdc_balance"] = round(
-            STATE.get("phantom_usdc_balance", 0.0) + amount_val, 6
-        )
-        _bump_hourly(STATE, "approved_usdc", amount_val)
-        _push_log(
-            STATE,
-            "APROVADA",
-            f"Acesso /radar/itens liberado via x402 ({payment_proof[:18]}...)",
-            f"+{PRICE_USDC} USDC",
-        )
-        items = STATE.get("signals", [])[:limit]
-        save_state(STATE)
-
-        return JSONResponse(
-            status_code=200,
-            content={
-                "version": APP_VERSION,
-                "network": "solana",
-                "asset": "USDC",
-                "count": len(items),
-                "items": items,
-            },
-        )
-
-
-@app.post("/webhooks", tags=["webhooks"])
-async def create_webhook(req: WebhookCreateRequest) -> JSONResponse:
-    async with STATE_LOCK:
-        entry = {
-            "agent_id": req.agent_id.strip(),
-            "webhook_url": req.webhook_url.strip(),
-            "active": True,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        STATE["webhooks"] = [
-            w for w in STATE.get("webhooks", []) if w.get("agent_id") != entry["agent_id"]
-        ]
-        STATE["webhooks"].append(entry)
-        _push_log(STATE, "WEBHOOK", f"Agente {entry['agent_id']} ativado -> {entry['webhook_url']}", "ATIVO")
-        save_state(STATE)
-        return JSONResponse(status_code=201, content={"status": "active", "webhook": entry})
-
-
-@app.get("/webhooks", tags=["webhooks"])
-async def list_webhooks() -> JSONResponse:
-    async with STATE_LOCK:
-        return JSONResponse(content={"webhooks": STATE.get("webhooks", [])})
-
-
-@app.post("/varrer", tags=["scanner"])
-async def trigger_scan_now() -> JSONResponse:
-    result = await run_scan_cycle(force=True)
-    return JSONResponse(content={"version": APP_VERSION, "result": result})
-
-
-@app.get("/status", tags=["system"])
-async def api_status() -> JSONResponse:
-    async with STATE_LOCK:
-        _refresh_rhythm(STATE)
-        return JSONResponse(
-            content={
-                "service": SERVICE_NAME,
-                "version": APP_VERSION,
-                "rhythm": STATE["rhythm_mode"],
-                "last_scan_at": STATE.get("last_scan_at"),
-                "next_scan_at": STATE.get("next_scan_at"),
-                "payment": {
-                    "protocol": "x402",
-                    "network": "solana",
-                    "asset": "USDC",
-                    "pay_to": SOLANA_PAY_TO,
-                    "price_usdc": PRICE_USDC,
-                },
+                "network": "base-mainnet",
+                "receiver": RECEIVER_WALLET,
+                "accepted_payments": [
+                    {
+                        "token": "USDC",
+                        "contract": ACCEPTED_TOKENS["USDC"]["address"],
+                        "min_amount": ACCEPTED_TOKENS["USDC"]["min_amount"]
+                    },
+                    {
+                        "token": "LINK",
+                        "contract": ACCEPTED_TOKENS["LINK"]["address"],
+                        "min_amount": ACCEPTED_TOKENS["LINK"]["min_amount"]
+                    }
+                ],
+                "instructions": "Transfira USDC ou LINK para o receiver e reenvie com o header X-Payment-Tx: <tx_hash>"
             }
         )
 
-
-# ==============================================================================
-# PAINEL VISUAL WEB (GET / E GET /painel)
-# ==============================================================================
-_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>__SERVICE_NAME__ — v__APP_VERSION__</title>
-  <style>
-    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { margin: 0; background: #070d19; color: #e6edf7; padding: 20px; }
-    .wrap { max-width: 1180px; margin: 0 auto; }
-    .top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
-    .title { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
-    .dot { width: 10px; height: 10px; border-radius: 50%; background: #10b981; display: inline-block; }
-    .meta-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 13px; }
-    .pill { background: #121c30; border: 1px solid #243452; padding: 6px 12px; border-radius: 8px; }
-    .btn { background: #16a34a; color: #fff; border: 0; padding: 7px 14px; border-radius: 8px; font-weight: 600; cursor: pointer; }
-    .btn-blue { background: #2563eb; color: #fff; border: 0; padding: 8px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; }
-    .grid-5 { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }
-    .card { background: #0d1627; border: 1px solid #1d2b44; border-radius: 12px; padding: 14px; }
-    .card-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.4px; }
-    .card-val { font-size: 24px; font-weight: 700; margin-top: 6px; }
-    .green { color: #34d399; }
-    .amber { color: #fbbf24; }
-    .blue { color: #60a5fa; }
-    .card-sub { font-size: 12px; color: #94a3b8; margin-top: 4px; }
-    .section { background: #0d1627; border: 1px solid #1d2b44; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-    .sec-title { font-size: 15px; font-weight: 700; margin-bottom: 12px; display: flex; justify-content: space-between; }
-    .hook-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-    .inp { background: #070d19; border: 1px solid #263859; color: #e6edf7; padding: 8px 12px; border-radius: 8px; min-width: 220px; flex: 1; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid #17243b; }
-    th { color: #94a3b8; font-size: 11px; text-transform: uppercase; }
-    .badge { background: #172554; color: #93c5fd; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <div class="title"><span class="dot"></span> Robo2 Signals — Monitor Autônomo (v__APP_VERSION__)</div>
-      <div class="meta-bar">
-        <span class="pill">Ritmo: <strong>__RHYTHM_MODE__</strong></span>
-        <span class="pill">Última varredura: <strong>__LAST_SCAN_AT__</strong></span>
-        <span class="pill">Hora: <strong id="clockNow">--:--:--</strong></span>
-        <button class="btn" onclick="scanNow()">Varrer Agora</button>
-      </div>
-    </div>
-
-    <div class="grid-5">
-      <div class="card">
-        <div class="card-label">Saldo Phantom (USDC)</div>
-        <div class="card-val green">$__PHANTOM_USDC__</div>
-        <div class="card-sub">Solana • __WALLET_SHORT__</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Operações Aprovadas</div>
-        <div class="card-val green">$__APPROVED_USDC__</div>
-        <div class="card-sub">__APPROVED_COUNT__ vendas aprovadas</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Cobranças 402</div>
-        <div class="card-val amber">__CHARGES_402__</div>
-        <div class="card-sub">Pedidos x402</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Chamadas Totais</div>
-        <div class="card-val blue">__TOTAL_CALLS__</div>
-        <div class="card-sub">__FISSURES_COUNT__ fissuras • __HOOKS_TRIGGERED__ hooks</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Sinais Coletados</div>
-        <div class="card-val blue">__SIGNALS_COLLECTED__</div>
-        <div class="card-sub">Economia + Multi-Redes</div>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="sec-title"><span>Webhook Autônomo de Saída (Agentes / Clientes)</span><span>__ACTIVE_HOOKS__ ativos</span></div>
-      <div class="hook-row">
-        <input id="agentId" class="inp" placeholder="ID do agente/cliente" />
-        <input id="webhookUrl" class="inp" placeholder="https://endpoint-do-cliente/webhook" />
-        <button class="btn-blue" onclick="activateWebhook()">Ativar Webhook</button>
-      </div>
-      <div class="card-sub" style="margin-top:8px;">Envia automaticamente o alerta e o caminho de pagamento x402 quando surge fissura crítica ou oportunidade.</div>
-    </div>
-
-    <div class="section">
-      <div class="sec-title"><span>Operações Aprovadas & Chamadas em Tempo Real</span><span id="hourlyBadge"></span></div>
-      <table>
-        <thead>
-          <tr><th>Hora</th><th>Status / Tipo</th><th>Operação / Chamada</th><th>Valor</th></tr>
-        </thead>
-        <tbody>__ROWS_HTML__</tbody>
-      </table>
-    </div>
-  </div>
-
-  <script>
-    const hourlyData = __HOURLY_JSON__;
-    function tickClock() {
-      const d = new Date();
-      document.getElementById("clockNow").textContent = d.toTimeString().slice(0, 8);
-      const hk = d.toTimeString().slice(0, 2) + ":00";
-      const b = hourlyData[hk] || { charges: 0, signals: 0, approved_usdc: 0 };
-      document.getElementById("hourlyBadge").textContent =
-        `Hora ${hk}: ${b.charges} cobranças • ${b.signals} sinais • $${Number(b.approved_usdc || 0).toFixed(2)} USDC`;
-    }
-    setInterval(tickClock, 1000);
-    tickClock();
-
-    async function scanNow() {
-      await fetch("/varrer", { method: "POST" });
-      location.reload();
-    }
-
-    async function activateWebhook() {
-      const agent_id = document.getElementById("agentId").value.trim();
-      const webhook_url = document.getElementById("webhookUrl").value.trim();
-      if (!agent_id || !webhook_url) return alert("Preencha o ID do agente e a URL do webhook.");
-      const res = await fetch("/webhooks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agent_id, webhook_url })
-      });
-      if (res.ok) location.reload();
-      else alert("Erro ao ativar webhook.");
-    }
-  </script>
-</body>
-</html>
-"""
-
-
-def _render_dashboard_html(state: Dict[str, Any]) -> str:
-    _refresh_rhythm(state)
-    active_hooks = sum(1 for w in state.get("webhooks", []) if w.get("active"))
-    rows_html = ""
-    for row in state.get("activity_log", [])[:30]:
-        rows_html += (
-            f"<tr>"
-            f"<td>{row.get('time', '--:--:--')}</td>"
-            f"<td><span class='badge'>{row.get('type', '')}</span></td>"
-            f"<td>{row.get('detail', '')}</td>"
-            f"<td>{row.get('value', '-')}</td>"
-            f"</tr>"
+    # Valida a transação direto na blockchain via RPC
+    payment = verify_onchain_payment(proof)
+    if not payment["valid"]:
+        return JSONResponse(
+            status_code=402,
+            content={"error": "Payment Rejected", "detail": payment["reason"]}
         )
 
-    wallet_short = (
-        f"{SOLANA_PAY_TO[:6]}...{SOLANA_PAY_TO[-4:]}"
-        if len(SOLANA_PAY_TO) > 10
-        else SOLANA_PAY_TO
+    clean_asset = asset.strip().upper()
+    signal = ROBO2_STATE["signals"].get(clean_asset)
+
+    # Se o ativo pedido não estiver no cache periódico, busca sob demanda na hora
+    if not signal:
+        async with httpx.AsyncClient() as client:
+            signal = await fetch_market_snapshot(client, clean_asset)
+
+    if not signal:
+        return JSONResponse(status_code=404, content={"error": f"Ativo {clean_asset} indisponível"})
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            **signal,
+            "settlement": {
+                "paid_with": payment["token"],
+                "amount": payment["amount"],
+                "tx_hash": payment["tx"]
+            }
+        }
     )
-    hourly_json = json.dumps(state.get("hourly_stats", {}), ensure_ascii=False)
-
-    html = _DASHBOARD_TEMPLATE
-    replacements = {
-        "__SERVICE_NAME__": SERVICE_NAME,
-        "__APP_VERSION__": APP_VERSION,
-        "__RHYTHM_MODE__": str(state.get("rhythm_mode", "ATIVO")),
-        "__LAST_SCAN_AT__": str(state.get("last_scan_at") or "--:--:--"),
-        "__PHANTOM_USDC__": f"{float(state.get('phantom_usdc_balance', 0.0)):.2f}",
-        "__WALLET_SHORT__": wallet_short,
-        "__APPROVED_USDC__": f"{float(state.get('approved_sales_usdc', 0.0)):.2f}",
-        "__APPROVED_COUNT__": str(state.get("approved_sales_count", 0)),
-        "__CHARGES_402__": str(state.get("x402_charges_count", 0)),
-        "__TOTAL_CALLS__": str(state.get("total_calls", 0)),
-        "__FISSURES_COUNT__": str(state.get("fissures_count", 0)),
-        "__HOOKS_TRIGGERED__": str(state.get("hooks_triggered_count", 0)),
-        "__SIGNALS_COLLECTED__": str(state.get("signals_collected_count", 0)),
-        "__ACTIVE_HOOKS__": str(active_hooks),
-        "__ROWS_HTML__": rows_html,
-        "__HOURLY_JSON__": hourly_json,
-    }
-    for k, v in replacements.items():
-        html = html.replace(k, v)
-    return html
-
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-@app.get("/painel", response_class=HTMLResponse, include_in_schema=False)
-async def painel() -> HTMLResponse:
-    async with STATE_LOCK:
-        return HTMLResponse(content=_render_dashboard_html(STATE))
