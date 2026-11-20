@@ -301,3 +301,96 @@ async def get_m2m_feed(
             }
         }
     )
+
+# =====================================================================
+# BLOCO ISOLADO: RECEBIMENTO EM TOKENS LÍQUIDOS (USDC + LINK)
+# Cole APENAS este trecho no final do seu main.py original.
+# Não altera o seu painel (/), nem /radar/itens, nem o seu hook.
+# =====================================================================
+import os
+import time
+from fastapi import Header
+from fastapi.responses import JSONResponse
+from web3 import Web3
+
+RECEIVER_WALLET_EVM = os.getenv("RECEIVER_WALLET", "0xSuaCarteiraAqui").lower()
+RPC_URL_BASE = os.getenv("RPC_URL", "https://mainnet.base.org")
+
+TOKENS_ACEITOS_M2M = {
+    "USDC": {
+        "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".lower(),
+        "decimals": 6,
+        "min_amount": float(os.getenv("PRICE_USDC", "0.01"))
+    },
+    "LINK": {
+        "address": "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196".lower(),
+        "decimals": 18,
+        "min_amount": float(os.getenv("PRICE_LINK", "0.0005"))
+    }
+}
+
+_w3_oracle = Web3(Web3.HTTPProvider(RPC_URL_BASE))
+_HASHES_USADOS = set()
+_TRANSFER_TOPIC = _w3_oracle.keccak(text="Transfer(address,address,uint256)").hex().lower()
+
+def _validar_tx_token(tx_hash: str) -> dict:
+    tx_clean = tx_hash.strip().lower()
+    if tx_clean in _HASHES_USADOS:
+        return {"valid": False, "reason": "Hash já utilizado"}
+    try:
+        receipt = _w3_oracle.eth.get_transaction_receipt(tx_clean)
+        if not receipt or receipt.status != 1:
+            return {"valid": False, "reason": "Transação não confirmada"}
+        for log in receipt.logs:
+            topics = [t.hex().lower() for t in log.topics]
+            if len(topics) >= 3 and topics[0] == _TRANSFER_TOPIC:
+                to_addr = "0x" + topics[2][-40:]
+                if to_addr.lower() == RECEIVER_WALLET_EVM:
+                    for symbol, info in TOKENS_ACEITOS_M2M.items():
+                        if log.address.lower() == info["address"]:
+                            amount = int(log.data.hex(), 16) / (10 ** info["decimals"])
+                            if amount >= info["min_amount"]:
+                                _HASHES_USADOS.add(tx_clean)
+                                return {"valid": True, "token": symbol, "amount": amount, "tx": tx_clean}
+        return {"valid": False, "reason": "Valor insuficiente ou token não aceito"}
+    except Exception as e:
+        return {"valid": False, "reason": str(e)}
+
+@app.get("/api/v1/m2m/feed/{asset}")
+async def m2m_token_feed(
+    asset: str,
+    x_payment_tx: str | None = Header(default=None, alias="X-Payment-Tx"),
+    x_payment: str | None = Header(default=None, alias="X-PAYMENT")
+):
+    proof = x_payment_tx or x_payment
+    if not proof:
+        return JSONResponse(
+            status_code=402,
+            content={
+                "error": "Payment Required",
+                "protocol": "x402",
+                "network": "base-mainnet",
+                "receiver": RECEIVER_WALLET_EVM,
+                "accepted_tokens": TOKENS_ACEITOS_M2M,
+                "header": "X-Payment-Tx"
+            }
+        )
+
+    check = _validar_tx_token(proof)
+    if not check["valid"]:
+        return JSONResponse(status_code=402, content={"error": "Payment Rejected", "detail": check["reason"]})
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "service": "Robo2 Signals",
+            "asset": asset.upper(),
+            "radar_endpoint": "/radar/itens",
+            "timestamp": int(time.time()),
+            "settlement": {
+                "token": check["token"],
+                "amount": check["amount"],
+                "tx_hash": check["tx"]
+            }
+        }
+    )
