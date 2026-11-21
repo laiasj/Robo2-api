@@ -1,8 +1,8 @@
-import asyncio
 import time
 from collections import deque
+from datetime import datetime, timezone
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 import aiohttp
 
@@ -12,21 +12,28 @@ app = FastAPI(title="Hub M2M Proxy Verifier")
 WALLET_ADDRESS = "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk"
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 USDC_MINT_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-MIN_USDC_PER_CHECK = 0.0005  # $0.0005 por validação de proxy
+MIN_USDC_PER_CHECK = 0.0005
 
-# === ESTADO EM MEMÓRIA PARA LIQUIDAÇÃO E MONITORAMENTO EM TEMPO REAL ===
+# === ESTADO EM TEMPO REAL ===
 used_proofs: set[str] = set()
-recent_events: deque[dict] = deque(maxlen=50)
+recent_events: deque[dict] = deque(maxlen=60)
+_latency_samples: deque[float] = deque(maxlen=200)
+
+daily_tracker = {
+    "day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+    "daily_transactions": 0,
+}
+
 stats = {
     "total_requests": 0,
-    "paid_requests": 0,
-    "rejected_402": 0,
+    "approved_tx": 0,
+    "denied_402": 0,
+    "error_tx": 0,
     "active_proxies": 0,
     "dead_proxies": 0,
     "total_received_usdc": 0.0,
     "avg_latency_ms": 0.0,
 }
-_latency_samples: deque[float] = deque(maxlen=200)
 
 
 class ProxyRequest(BaseModel):
@@ -35,22 +42,41 @@ class ProxyRequest(BaseModel):
     timeout: int = 4
 
 
+def touch_daily_counter() -> int:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if daily_tracker["day"] != today:
+        daily_tracker["day"] = today
+        daily_tracker["daily_transactions"] = 0
+    daily_tracker["daily_transactions"] += 1
+    return daily_tracker["daily_transactions"]
+
+
+def get_daily_count() -> int:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if daily_tracker["day"] != today:
+        daily_tracker["day"] = today
+        daily_tracker["daily_transactions"] = 0
+    return daily_tracker["daily_transactions"]
+
+
 def record_latency(ms: float) -> None:
     _latency_samples.append(ms)
     stats["avg_latency_ms"] = round(sum(_latency_samples) / len(_latency_samples), 2)
 
 
-async def verify_solana_usdc_payment(tx_signature: str | None) -> bool:
+async def verify_solana_usdc_payment(tx_signature: str | None) -> tuple[bool, str]:
     """
-    Consulta a assinatura da transação na RPC da Solana e confirma se houve
-    transferência de USDC para WALLET_ADDRESS com valor >= MIN_USDC_PER_CHECK.
+    Retorna (ok, motivo):
+    - (True, "APPROVED")
+    - (False, "DENIED") se pagamento inválido/ausente/duplicado
+    - (False, "ERROR") se falhar consulta RPC/rede
     """
-    if not tx_signature:
-        return False
+    if not tx_signature or len(tx_signature.strip()) < 64:
+        return False, "DENIED"
 
     sig = tx_signature.strip()
-    if len(sig) < 64 or sig in used_proofs:
-        return False
+    if sig in used_proofs:
+        return False, "DENIED"
 
     payload = {
         "jsonrpc": "2.0",
@@ -69,11 +95,19 @@ async def verify_solana_usdc_payment(tx_signature: str | None) -> bool:
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=4),
             ) as resp:
+                if resp.status >= 500:
+                    return False, "ERROR"
                 data = await resp.json()
 
+        if "error" in data:
+            return False, "ERROR"
+
         tx_result = data.get("result")
-        if not tx_result or tx_result.get("meta", {}).get("err") is not None:
-            return False
+        if not tx_result:
+            return False, "DENIED"
+
+        if tx_result.get("meta", {}).get("err") is not None:
+            return False, "DENIED"
 
         meta = tx_result["meta"]
         pre_balances = meta.get("preTokenBalances", [])
@@ -95,11 +129,16 @@ async def verify_solana_usdc_payment(tx_signature: str | None) -> bool:
                     stats["total_received_usdc"] = round(
                         stats["total_received_usdc"] + (post_amt - pre_amt), 6
                     )
-                    return True
+                    return True, "APPROVED"
 
-        return False
+        return False, "DENIED"
     except Exception:
-        return False
+        return False, "ERROR"
+
+
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/dashboard")
 
 
 @app.post("/v1/verify-proxy")
@@ -108,13 +147,30 @@ async def verify_proxy(
     x_payment_proof: str | None = Header(default=None, alias="X-Payment-Proof"),
 ):
     stats["total_requests"] += 1
+    daily_now = touch_daily_counter()
+    now_ts = int(time.time())
 
-    paid = await verify_solana_usdc_payment(x_payment_proof)
+    paid, outcome = await verify_solana_usdc_payment(x_payment_proof)
     if not paid:
-        stats["rejected_402"] += 1
+        if outcome == "ERROR":
+            stats["error_tx"] += 1
+            recent_events.appendleft({
+                "ts": now_ts,
+                "proxy": payload.proxy_url,
+                "category": "ERRO",
+                "status": "RPC_OR_PAYMENT_ERROR",
+                "latency_ms": 0,
+            })
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "Payment verification temporary error", "daily_transactions": daily_now},
+            )
+
+        stats["denied_402"] += 1
         recent_events.appendleft({
-            "ts": int(time.time()),
+            "ts": now_ts,
             "proxy": payload.proxy_url,
+            "category": "NEGADA",
             "status": "402_PAYMENT_REQUIRED",
             "latency_ms": 0,
         })
@@ -130,7 +186,7 @@ async def verify_proxy(
             },
         )
 
-    stats["paid_requests"] += 1
+    stats["approved_tx"] += 1
     start = time.perf_counter()
 
     try:
@@ -144,35 +200,39 @@ async def verify_proxy(
                 record_latency(latency_ms)
                 stats["active_proxies"] += 1
 
-                result = {
+                recent_events.appendleft({
+                    "ts": int(time.time()),
+                    "proxy": payload.proxy_url,
+                    "category": "APROVADA",
+                    "status": f"ACTIVE ({resp.status})",
+                    "latency_ms": latency_ms,
+                })
+                return {
                     "status": "active",
                     "http_code": resp.status,
                     "latency_ms": latency_ms,
+                    "daily_transactions": daily_now,
                     "verified_at": int(time.time()),
                 }
-                recent_events.appendleft({
-                    "ts": result["verified_at"],
-                    "proxy": payload.proxy_url,
-                    "status": "ACTIVE",
-                    "latency_ms": latency_ms,
-                })
-                return result
 
     except Exception as exc:
         latency_ms = round((time.perf_counter() - start) * 1000, 2)
         record_latency(latency_ms)
         stats["dead_proxies"] += 1
+        stats["error_tx"] += 1
 
         recent_events.appendleft({
             "ts": int(time.time()),
             "proxy": payload.proxy_url,
-            "status": f"DEAD ({type(exc).__name__})",
+            "category": "ERRO",
+            "status": f"PROXY_ERROR ({type(exc).__name__})",
             "latency_ms": latency_ms,
         })
         return {
             "status": "dead_or_blocked",
             "error": type(exc).__name__,
             "latency_ms": latency_ms,
+            "daily_transactions": daily_now,
             "verified_at": int(time.time()),
         }
 
@@ -182,6 +242,7 @@ async def telemetry():
     return {
         "wallet": WALLET_ADDRESS,
         "asset": "USDC (Solana)",
+        "daily_transactions": get_daily_count(),
         "stats": stats,
         "recent_events": list(recent_events),
     }
@@ -194,45 +255,78 @@ async def dashboard():
     <html lang="pt-BR">
     <head>
       <meta charset="UTF-8" />
-      <title>Monitoramento M2M — Proxy Verifier</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>Painel M2M em Tempo Real</title>
       <style>
-        body { font-family: Arial, sans-serif; background: #111; color: #eee; margin: 24px; }
-        .grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
-        .card { background: #1c1c1c; padding: 16px; border-radius: 8px; border: 1px solid #2e2e2e; }
-        .label { font-size: 12px; color: #aaa; }
-        .val { font-size: 22px; font-weight: bold; margin-top: 6px; }
-        table { width: 100%; border-collapse: collapse; background: #1c1c1c; }
-        th, td { padding: 10px; border-bottom: 1px solid #2e2e2e; text-align: left; font-size: 13px; }
+        body { font-family: Arial, sans-serif; background: #0e1015; color: #f1f5f9; margin: 20px; }
+        .top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+        .wallet { font-size: 13px; color: #93c5fd; word-break: break-all; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 20px; }
+        .card { background: #171b24; padding: 14px; border-radius: 10px; border: 1px solid #283042; }
+        .label { font-size: 12px; color: #94a3b8; }
+        .val { font-size: 24px; font-weight: bold; margin-top: 6px; }
+        .ok { color: #4ade80; }
+        .neg { color: #fbbf24; }
+        .err { color: #f87171; }
+        table { width: 100%; border-collapse: collapse; background: #171b24; border-radius: 10px; overflow: hidden; }
+        th, td { padding: 10px 12px; border-bottom: 1px solid #283042; text-align: left; font-size: 13px; }
+        th { background: #1e2430; color: #cbd5e1; }
       </style>
     </head>
     <body>
-      <h2>Painel em Tempo Real — Proxy Verifier (Hub)</h2>
-      <div id="wallet" style="margin-bottom:16px; color:#9ad;"></div>
+      <div class="top">
+        <h2 style="margin:0;">Monitoramento de Transações em Tempo Real</h2>
+        <div class="wallet" id="wallet">Carregando carteira...</div>
+      </div>
       <div class="grid">
-        <div class="card"><div class="label">Requisições Totais</div><div class="val" id="total">0</div></div>
-        <div class="card"><div class="label">Pagas / Validadas</div><div class="val" id="paid">0</div></div>
-        <div class="card"><div class="label">Bloqueadas (402)</div><div class="val" id="rej">0</div></div>
-        <div class="card"><div class="label">Saldo Acumulado</div><div class="val" id="usdc">$0</div></div>
+        <div class="card"><div class="label">Transações Hoje (Dia)</div><div class="val" id="daily">0</div></div>
+        <div class="card"><div class="label">Aprovadas</div><div class="val ok" id="approved">0</div></div>
+        <div class="card"><div class="label">Negadas (402)</div><div class="val neg" id="denied">0</div></div>
+        <div class="card"><div class="label">Com Erro</div><div class="val err" id="errors">0</div></div>
+        <div class="card"><div class="label">USDC Acumulado</div><div class="val ok" id="usdc">$0</div></div>
         <div class="card"><div class="label">Latência Média</div><div class="val" id="lat">0 ms</div></div>
       </div>
       <table>
-        <thead><tr><th>Proxy</th><th>Status</th><th>Latência</th></tr></thead>
+        <thead>
+          <tr><th>Hora</th><th>Proxy</th><th>Tipo</th><th>Detalhe</th><th>Latência</th></tr>
+        </thead>
         <tbody id="feed"></tbody>
       </table>
       <script>
+        function fmtTime(ts) {
+          if (!ts) return '-';
+          return new Date(ts * 1000).toLocaleTimeString('pt-BR');
+        }
         async function refresh() {
-          const r = await fetch('/api/telemetry');
-          const data = await r.json();
-          document.getElementById('wallet').innerText = 'Carteira: ' + data.wallet + ' (' + data.asset + ')';
-          document.getElementById('total').innerText = data.stats.total_requests;
-          document.getElementById('paid').innerText = data.stats.paid_requests;
-          document.getElementById('rej').innerText = data.stats.rejected_402;
-          document.getElementById('usdc').innerText = '$' + data.stats.total_received_usdc;
-          document.getElementById('lat').innerText = data.stats.avg_latency_ms + ' ms';
-          const tbody = document.getElementById('feed');
-          tbody.innerHTML = data.recent_events.map(ev =>
-            `<tr><td>${ev.proxy}</td><td>${ev.status}</td><td>${ev.latency_ms} ms</td></tr>`
-          ).join('');
+          try {
+            const r = await fetch('/api/telemetry', { cache: 'no-store' });
+            const data = await r.json();
+            document.getElementById('wallet').innerText = 'Carteira: ' + data.wallet + ' (' + data.asset + ')';
+            document.getElementById('daily').innerText = data.daily_transactions;
+            document.getElementById('approved').innerText = data.stats.approved_tx;
+            document.getElementById('denied').innerText = data.stats.denied_402;
+            document.getElementById('errors').innerText = data.stats.error_tx;
+            document.getElementById('usdc').innerText = '$' + data.stats.total_received_usdc;
+            document.getElementById('lat').innerText = data.stats.avg_latency_ms + ' ms';
+
+            const tbody = document.getElementById('feed');
+            if (!data.recent_events.length) {
+              tbody.innerHTML = '<tr><td colspan="5">Nenhuma transação registrada ainda.</td></tr>';
+              return;
+            }
+            tbody.innerHTML = data.recent_events.map(ev => {
+              const cls = ev.category === 'APROVADA' ? 'ok' : (ev.category === 'NEGADA' ? 'neg' : 'err');
+              return `<tr>
+                <td>${fmtTime(ev.ts)}</td>
+                <td>${ev.proxy}</td>
+                <td class="${cls}"><strong>${ev.category}</strong></td>
+                <td>${ev.status}</td>
+                <td>${ev.latency_ms} ms</td>
+              </tr>`;
+            }).join('');
+          } catch (e) {
+            console.error(e);
+          }
         }
         refresh();
         setInterval(refresh, 1500);
