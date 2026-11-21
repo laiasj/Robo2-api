@@ -10,14 +10,13 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
-
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
 # ==============================================================================
 # CONFIGURAÇÃO & VARIÁVEIS DE AMBIENTE (RENDER)
 # ==============================================================================
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.3.0"
 
 PAY_TO_ADDRESS = (
     os.getenv("PAY_TO_ADDRESS")
@@ -30,11 +29,16 @@ PAY_TO_ADDRESS = (
 EXECUTOR_PRIVATE_KEY = os.getenv("EXECUTOR_PRIVATE_KEY", "").strip()
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
 
+# Endpoint JSON-RPC do Kora (ex.: https://seu-kora.onrender.com) e chave opcional
+KORA_RPC_URL = (os.getenv("KORA_RPC_URL") or os.getenv("GASLESS_SPONSOR_URL") or "").strip()
+KORA_API_KEY = (os.getenv("KORA_API_KEY") or os.getenv("GASLESS_SPONSOR_API_KEY") or "").strip()
+
 # Parâmetros de gatilho e risco
 MIN_FISSURE_SPREAD_PCT = float(os.getenv("MIN_FISSURE_SPREAD_PCT", "0.015"))
 MIN_POSITIVE_EDGE_PCT = float(os.getenv("MIN_POSITIVE_EDGE_PCT", "0.02"))
 ESTIMATED_COST_PCT = float(os.getenv("ESTIMATED_COST_PCT", "0.01"))
-MIN_PROFIT_USDC = float(os.getenv("MIN_PROFIT_USDC", "0.10"))  # Mínimo $0.10 lucro líquido
+MIN_PROFIT_USDC = float(os.getenv("MIN_PROFIT_USDC", "0.10"))
+DEFAULT_NOTIONAL_USDC = float(os.getenv("DEFAULT_NOTIONAL_USDC", "100.0"))
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "12.0"))
 AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
 
@@ -64,7 +68,7 @@ JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 
 # ==============================================================================
-# ESTADO EM MEMÓRIA (LEVE E RÁPIDO)
+# ESTADO EM MEMÓRIA
 # ==============================================================================
 STATE: dict[str, Any] = {
     "version": APP_VERSION,
@@ -74,7 +78,14 @@ STATE: dict[str, Any] = {
     "signals": {},
     "routes": [],
     "execution_signal": {"positive": False, "best_route": None, "net_edge_pct": 0.0},
-    "stats": {"total": 0, "approved": 0, "failed": 0, "rejected": 0, "profit_usdc": 0.0},
+    "stats": {
+        "total": 0,
+        "approved": 0,
+        "failed": 0,
+        "rejected": 0,
+        "profit_usdc": 0.0,
+        "sponsored_txs": 0,
+    },
     "history": [],
 }
 
@@ -128,6 +139,51 @@ async def _rpc_call(method: str, params: list[Any]) -> dict[str, Any]:
     if "error" in data:
         raise RuntimeError(str(data["error"]))
     return data
+
+
+async def _dispatch_transaction(signed_tx_b64: str) -> tuple[str, bool]:
+    """Envia via nó Kora (JSON-RPC 2.0) se configurado; caso contrário, usa RPC da Solana."""
+    assert http_client is not None
+    if KORA_RPC_URL:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if KORA_API_KEY:
+            headers["x-api-key"] = KORA_API_KEY
+            headers["Authorization"] = f"Bearer {KORA_API_KEY}"
+
+        resp = await http_client.post(
+            KORA_RPC_URL,
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "signAndSendTransaction",
+                "params": {"transaction": signed_tx_b64},
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if "error" in payload:
+            raise RuntimeError(str(payload["error"]))
+
+        res = payload.get("result", {})
+        if isinstance(res, dict):
+            tx_sig = str(res.get("signature") or res.get("txSignature") or "")
+        else:
+            tx_sig = str(res)
+        return tx_sig, True
+
+    send_data = await _rpc_call(
+        "sendTransaction",
+        [
+            signed_tx_b64,
+            {
+                "encoding": "base64",
+                "skipPreflight": False,
+                "preflightCommitment": "confirmed",
+            },
+        ],
+    )
+    return str(send_data.get("result", "")), False
 
 
 # ==============================================================================
@@ -225,11 +281,11 @@ def _compute_routes() -> None:
 
 
 # ==============================================================================
-# EXECUTOR ATÔMICO ON-CHAIN (JUPITER ROUND-TRIP + SIMULAÇÃO OBRIGATÓRIA)
+# EXECUTOR ATÔMICO ON-CHAIN (SIMULAÇÃO + KORA PAYMASTER)
 # ==============================================================================
 class ExecuteRequest(BaseModel):
     asset: str = Field(default="SOL", description="Ativo alvo: SOL, BTC, ETH ou LINK")
-    notional_usdc: float = Field(default=100.0, gt=0, description="Valor base da operação em USDC")
+    notional_usdc: float = Field(default=DEFAULT_NOTIONAL_USDC, gt=0, description="Valor base em USDC")
     force: bool = Field(default=False, description="Ignora trava de fissura ALTA para teste")
     dry_run: bool = Field(default=True, description="True = apenas simula na rede sem gastar")
 
@@ -243,14 +299,13 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
         return {"ok": False, "status": "RECUSADA", "reason": "Ativo não suportado"}
 
     sig = STATE["signals"].get(asset)
-    if not req.force:
-        if not sig or sig["fissure"] != "ALTA":
-            _record_op("RECUSADA", route_label, req.notional_usdc, "Fissura não está ALTA")
-            return {"ok": False, "status": "RECUSADA", "reason": "Fissura não está ALTA"}
+    if not req.force and (not sig or sig["fissure"] != "ALTA"):
+        _record_op("RECUSADA", route_label, req.notional_usdc, "Fissura não está ALTA")
+        return {"ok": False, "status": "RECUSADA", "reason": "Fissura não está ALTA"}
 
     kp = _load_keypair()
     if kp is None:
-        _record_op("RECUSADA", route_label, req.notional_usdc, "EXECUTOR_PRIVATE_KEY ausente no Render")
+        _record_op("RECUSADA", route_label, req.notional_usdc, "EXECUTOR_PRIVATE_KEY ausente")
         return {
             "ok": False,
             "status": "RECUSADA",
@@ -292,7 +347,12 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
         if expected_profit < MIN_PROFIT_USDC and not req.force:
             msg = f"Lucro líquido insuficiente (${expected_profit} < ${MIN_PROFIT_USDC})"
             _record_op("RECUSADA", route_label, req.notional_usdc, msg)
-            return {"ok": False, "status": "RECUSADA", "reason": msg, "expected_profit_usdc": expected_profit}
+            return {
+                "ok": False,
+                "status": "RECUSADA",
+                "reason": msg,
+                "expected_profit_usdc": expected_profit,
+            }
 
         swap_resp = await http_client.post(
             JUPITER_SWAP_URL,
@@ -311,7 +371,6 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
         signed_tx = VersionedTransaction(raw_tx.message, [kp])
         signed_tx_b64 = base64.b64encode(bytes(signed_tx)).decode("ascii")
 
-        # Simulação obrigatória no RPC antes de enviar
         sim_data = await _rpc_call(
             "simulateTransaction",
             [signed_tx_b64, {"encoding": "base64", "commitment": "confirmed"}],
@@ -332,24 +391,19 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
                 "detail": msg,
             }
 
-        send_data = await _rpc_call(
-            "sendTransaction",
-            [
-                signed_tx_b64,
-                {
-                    "encoding": "base64",
-                    "skipPreflight": False,
-                    "preflightCommitment": "confirmed",
-                },
-            ],
-        )
-        tx_sig = str(send_data.get("result", ""))
-        STATE["stats"]["profit_usdc"] = round(STATE["stats"]["profit_usdc"] + max(expected_profit, 0.0), 4)
-        msg = f"TX enviada: {tx_sig[:12]}... | Lucro est.: ${expected_profit}"
+        tx_sig, sponsored = await _dispatch_transaction(signed_tx_b64)
+        if sponsored:
+            STATE["stats"]["sponsored_txs"] += 1
+
+        realized_profit = max(expected_profit, 0.0)
+        STATE["stats"]["profit_usdc"] = round(STATE["stats"]["profit_usdc"] + realized_profit, 4)
+        modo_txt = "KORA" if sponsored else "RPC"
+        msg = f"[{modo_txt}] TX: {tx_sig[:12]}... | Lucro est.: ${expected_profit}"
         _record_op("APROVADA", route_label, req.notional_usdc, msg)
         return {
             "ok": True,
             "status": "ENVIADA",
+            "sponsored_gas": sponsored,
             "tx_signature": tx_sig,
             "expected_profit_usdc": expected_profit,
         }
@@ -380,7 +434,12 @@ async def _oracle_loop() -> None:
         if AUTO_EXECUTE and exec_sig["positive"] and exec_sig["best_route"]:
             best_asset = exec_sig["best_route"]["asset"]
             await execute_arbitrage_onchain(
-                ExecuteRequest(asset=best_asset, notional_usdc=100.0, force=False, dry_run=False)
+                ExecuteRequest(
+                    asset=best_asset,
+                    notional_usdc=DEFAULT_NOTIONAL_USDC,
+                    force=False,
+                    dry_run=False,
+                )
             )
 
         elapsed = time.monotonic() - start
@@ -392,7 +451,10 @@ async def lifespan(_: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0))
     task = asyncio.create_task(_oracle_loop())
-    print(f"[Robo2 v{APP_VERSION}] Online | Carteira: {PAY_TO_ADDRESS} | AutoExecute: {AUTO_EXECUTE}")
+    print(
+        f"[Robo2 v{APP_VERSION}] Online | Carteira: {PAY_TO_ADDRESS} | "
+        f"Kora: {bool(KORA_RPC_URL)} | AutoExecute: {AUTO_EXECUTE}"
+    )
     try:
         yield
     finally:
@@ -412,6 +474,7 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "version": APP_VERSION,
         "wallet_configured": bool(EXECUTOR_PRIVATE_KEY),
+        "kora_configured": bool(KORA_RPC_URL),
         "auto_execute": AUTO_EXECUTE,
         "last_update": STATE["last_update"],
         "last_error": STATE["last_error"],
@@ -476,6 +539,7 @@ async def dashboard() -> str:
         rows_hist = '<tr><td colspan="5">Nenhuma execução registrada ainda.</td></tr>'
 
     signer_status = "CONFIGURADA" if EXECUTOR_PRIVATE_KEY else "PENDENTE (Env Var EXECUTOR_PRIVATE_KEY)"
+    kora_status = "ATIVO (KORA)" if KORA_RPC_URL else "RPC PADRÃO"
 
     return f"""
     <!doctype html>
@@ -497,7 +561,7 @@ async def dashboard() -> str:
         <div class="card" style="display:flex;justify-content:space-between;align-items:center;">
             <div>
                 <h2 style="margin:0;">Robo2 Signals & Executor (v{APP_VERSION})</h2>
-                <small>Última leitura: {STATE['last_update'] or '--'} | Atualização a cada 6s</small>
+                <small>Última leitura: {STATE['last_update'] or '--'} | Fee Payer: {kora_status} | Atualização a cada 6s</small>
             </div>
             <span class="pill">ONLINE</span>
         </div>
