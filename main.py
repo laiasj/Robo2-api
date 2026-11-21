@@ -1,18 +1,24 @@
+import asyncio
+import os
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 import aiohttp
 
-app = FastAPI(title="Hub M2M Proxy Verifier")
-
-# === CARTEIRA SOLANA E COBRANÇA EM USDC ===
-WALLET_ADDRESS = "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk"
-SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
-USDC_MINT_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-MIN_USDC_PER_CHECK = 0.0005
+# === CARTEIRA SOLANA, COBRANÇA USDC E DESCOBERTA ===
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk")
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+USDC_MINT_SOLANA = os.getenv("USDC_MINT_SOLANA", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+MIN_USDC_PER_CHECK = float(os.getenv("MIN_USDC_PER_CHECK", "0.0005"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+ANNOUNCE_INTERVAL_SEC = int(os.getenv("ANNOUNCE_INTERVAL_SEC", "300"))
+ANNOUNCE_URLS = [
+    u.strip() for u in os.getenv("ANNOUNCE_URLS", "").split(",") if u.strip()
+]
 
 # === ESTADO EM TEMPO REAL ===
 used_proofs: set[str] = set()
@@ -64,12 +70,68 @@ def record_latency(ms: float) -> None:
     stats["avg_latency_ms"] = round(sum(_latency_samples) / len(_latency_samples), 2)
 
 
+def service_metadata() -> dict:
+    base = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else ""
+    return {
+        "service": "M2M Proxy Verifier",
+        "protocol": "HTTP-402",
+        "network": "solana-mainnet",
+        "asset": "USDC",
+        "usdc_mint": USDC_MINT_SOLANA,
+        "wallet": WALLET_ADDRESS,
+        "price_per_check_usdc": MIN_USDC_PER_CHECK,
+        "payment_header": "X-Payment-Proof",
+        "verify_endpoint": f"{base}/v1/verify-proxy" if base else "/v1/verify-proxy",
+        "telemetry_endpoint": f"{base}/api/telemetry" if base else "/api/telemetry",
+        "avg_latency_ms": stats["avg_latency_ms"],
+    }
+
+
+async def announce_once() -> None:
+    if not ANNOUNCE_URLS:
+        return
+    payload = service_metadata()
+    async with aiohttp.ClientSession() as session:
+        for url in ANNOUNCE_URLS:
+            try:
+                async with session.post(
+                    url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    _ = await resp.text()
+            except Exception:
+                pass
+
+
+async def announcement_loop() -> None:
+    while True:
+        await announce_once()
+        await asyncio.sleep(max(30, ANNOUNCE_INTERVAL_SEC))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(announcement_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Hub M2M Proxy Verifier", lifespan=lifespan)
+
+
 async def verify_solana_usdc_payment(tx_signature: str | None) -> tuple[bool, str]:
     """
-    Retorna (ok, motivo):
-    - (True, "APPROVED")
-    - (False, "DENIED") se pagamento inválido/ausente/duplicado
-    - (False, "ERROR") se falhar consulta RPC/rede
+    Valida transação real na RPC da Solana:
+    - (True, "APPROVED") quando transfere >= MIN_USDC_PER_CHECK em USDC para WALLET_ADDRESS
+    - (False, "DENIED") quando assinatura ausente, inválida, já utilizada ou sem valor suficiente
+    - (False, "ERROR") quando houver falha de rede/RPC
     """
     if not tx_signature or len(tx_signature.strip()) < 64:
         return False, "DENIED"
@@ -124,10 +186,11 @@ async def verify_solana_usdc_payment(tx_signature: str | None) -> tuple[bool, st
                 idx = item["accountIndex"]
                 post_amt = float(item.get("uiTokenAmount", {}).get("uiAmount") or 0.0)
                 pre_amt = pre_map.get((idx, USDC_MINT_SOLANA), 0.0)
-                if (post_amt - pre_amt) >= MIN_USDC_PER_CHECK:
+                delta = post_amt - pre_amt
+                if delta >= MIN_USDC_PER_CHECK:
                     used_proofs.add(sig)
                     stats["total_received_usdc"] = round(
-                        stats["total_received_usdc"] + (post_amt - pre_amt), 6
+                        stats["total_received_usdc"] + delta, 6
                     )
                     return True, "APPROVED"
 
@@ -139,6 +202,11 @@ async def verify_solana_usdc_payment(tx_signature: str | None) -> tuple[bool, st
 @app.get("/")
 async def root():
     return RedirectResponse(url="/dashboard")
+
+
+@app.get("/v1/info")
+async def info():
+    return service_metadata()
 
 
 @app.post("/v1/verify-proxy")
@@ -180,6 +248,7 @@ async def verify_proxy(
                 "error": "Payment Required",
                 "network": "solana-mainnet",
                 "asset": "USDC",
+                "usdc_mint": USDC_MINT_SOLANA,
                 "wallet": WALLET_ADDRESS,
                 "min_amount_usdc": MIN_USDC_PER_CHECK,
                 "header": "X-Payment-Proof",
