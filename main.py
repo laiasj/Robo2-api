@@ -16,7 +16,7 @@ from solders.transaction import VersionedTransaction
 # ==============================================================================
 # CONFIGURAÇÃO & VARIÁVEIS DE AMBIENTE (RENDER)
 # ==============================================================================
-APP_VERSION = "4.3.1"
+APP_VERSION = "4.3.2"
 
 PAY_TO_ADDRESS = (
     os.getenv("PAY_TO_ADDRESS")
@@ -60,8 +60,8 @@ COINGECKO_IDS: dict[str, str] = {
     "LINK": "chainlink",
 }
 
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE_URL = os.getenv("JUPITER_QUOTE_URL", "https://public.jupiterapi.com/quote").strip()
+JUPITER_SWAP_URL = os.getenv("JUPITER_SWAP_URL", "https://public.jupiterapi.com/swap").strip()
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 
 STATE: dict[str, Any] = {
@@ -190,6 +190,10 @@ async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str
     mint, decimals = mint_info
     one_unit = 10**decimals
 
+    out_usdc: float | None = None
+    ref_price: float | None = None
+    jup_err: Exception | None = None
+
     try:
         jup_resp = await client.get(
             JUPITER_QUOTE_URL,
@@ -202,48 +206,59 @@ async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str
         )
         jup_resp.raise_for_status()
         out_usdc = int(jup_resp.json()["outAmount"]) / 1_000_000
-
-        ref_price = out_usdc
-        try:
-            cg_resp = await client.get(
-                COINGECKO_PRICE_URL,
-                params={"ids": cg_id, "vs_currencies": "usd"},
-            )
-            cg_resp.raise_for_status()
-            cg_val = cg_resp.json().get(cg_id, {}).get("usd")
-            if cg_val is not None:
-                ref_price = float(cg_val)
-        except Exception as cg_exc:
-            print(f"[Robo2 v{APP_VERSION}][AVISO] CoinGecko {asset} falhou ({cg_exc}), usando Jupiter", flush=True)
-
-        mid = (ref_price + out_usdc) / 2.0
-        bid = min(ref_price, out_usdc)
-        ask = max(ref_price, out_usdc)
-        spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else 0.0
-
-        if spread_pct >= MIN_FISSURE_SPREAD_PCT:
-            fissure = "ALTA"
-            active = True
-        elif spread_pct > 0:
-            fissure = "MODERADA"
-            active = False
-        else:
-            fissure = "NEUTRA"
-            active = False
-
-        return {
-            "asset": asset,
-            "mid": round(mid, 6),
-            "bid": round(bid, 6),
-            "ask": round(ask, 6),
-            "spread_pct": round(spread_pct, 5),
-            "fissure": fissure,
-            "active": active,
-            "updated_at": _now_str(),
-        }
     except Exception as exc:
-        _set_error(f"Oráculo {asset}: {exc}")
+        jup_err = exc
+
+    try:
+        cg_resp = await client.get(
+            COINGECKO_PRICE_URL,
+            params={"ids": cg_id, "vs_currencies": "usd"},
+        )
+        cg_resp.raise_for_status()
+        cg_val = cg_resp.json().get(cg_id, {}).get("usd")
+        if cg_val is not None:
+            ref_price = float(cg_val)
+    except Exception as cg_exc:
+        if out_usdc is None:
+            _set_error(f"Oráculo {asset}: Jupiter ({jup_err}) e CoinGecko ({cg_exc})")
+            return None
+
+    if out_usdc is None and ref_price is None:
         return None
+
+    if out_usdc is None:
+        out_usdc = ref_price
+    if ref_price is None:
+        ref_price = out_usdc
+
+    if jup_err is not None:
+        _set_error(f"Oráculo {asset} (Jupiter falhou, usando ref): {jup_err}")
+
+    mid = (ref_price + out_usdc) / 2.0
+    bid = min(ref_price, out_usdc)
+    ask = max(ref_price, out_usdc)
+    spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else 0.0
+
+    if spread_pct >= MIN_FISSURE_SPREAD_PCT:
+        fissure = "ALTA"
+        active = True
+    elif spread_pct > 0:
+        fissure = "MODERADA"
+        active = False
+    else:
+        fissure = "NEUTRA"
+        active = False
+
+    return {
+        "asset": asset,
+        "mid": round(mid, 6),
+        "bid": round(bid, 6),
+        "ask": round(ask, 6),
+        "spread_pct": round(spread_pct, 5),
+        "fissure": fissure,
+        "active": active,
+        "updated_at": _now_str(),
+    }
 
 
 def _compute_routes() -> None:
