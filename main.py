@@ -1,620 +1,242 @@
 import asyncio
-import base64
-import os
 import time
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any
+from collections import deque
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import aiohttp
 
-import httpx
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
-from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
+app = FastAPI(title="Hub M2M Proxy Verifier")
 
-# ==============================================================================
-# CONFIGURAÇÃO & VARIÁVEIS DE AMBIENTE (RENDER)
-# ==============================================================================
-APP_VERSION = "4.3.2"
+# === CARTEIRA SOLANA E COBRANÇA EM USDC ===
+WALLET_ADDRESS = "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk"
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+USDC_MINT_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+MIN_USDC_PER_CHECK = 0.0005  # $0.0005 por validação de proxy
 
-PAY_TO_ADDRESS = (
-    os.getenv("PAY_TO_ADDRESS")
-    or os.getenv("SOLANA_PAY_TO")
-    or os.getenv("RECEIVER_WALLET")
-    or "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk"
-).strip()
-
-EXECUTOR_PRIVATE_KEY = os.getenv("EXECUTOR_PRIVATE_KEY", "").strip()
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
-
-KORA_RPC_URL = (os.getenv("KORA_RPC_URL") or os.getenv("GASLESS_SPONSOR_URL") or "").strip()
-KORA_API_KEY = (os.getenv("KORA_API_KEY") or os.getenv("GASLESS_SPONSOR_API_KEY") or "").strip()
-
-MIN_FISSURE_SPREAD_PCT = float(os.getenv("MIN_FISSURE_SPREAD_PCT", "0.015"))
-MIN_POSITIVE_EDGE_PCT = float(os.getenv("MIN_POSITIVE_EDGE_PCT", "0.02"))
-ESTIMATED_COST_PCT = float(os.getenv("ESTIMATED_COST_PCT", "0.01"))
-MIN_PROFIT_USDC = float(os.getenv("MIN_PROFIT_USDC", "0.10"))
-DEFAULT_NOTIONAL_USDC = float(os.getenv("DEFAULT_NOTIONAL_USDC", "100.0"))
-POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "12.0"))
-AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
-
-TRACKED_ASSETS = [
-    a.strip().upper()
-    for a in os.getenv("TRACKED_ASSETS", "SOL,BTC,ETH,LINK").split(",")
-    if a.strip()
-]
-
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-MINTS: dict[str, tuple[str, int]] = {
-    "SOL": ("So11111111111111111111111111111111111111112", 9),
-    "BTC": ("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E", 6),
-    "ETH": ("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", 8),
-    "LINK": ("CWE8jPTUYhdCTZYWPTe1o5DFhfdmzWKc9WK618d62452", 6),
+# === ESTADO EM MEMÓRIA PARA LIQUIDAÇÃO E MONITORAMENTO EM TEMPO REAL ===
+used_proofs: set[str] = set()
+recent_events: deque[dict] = deque(maxlen=50)
+stats = {
+    "total_requests": 0,
+    "paid_requests": 0,
+    "rejected_402": 0,
+    "active_proxies": 0,
+    "dead_proxies": 0,
+    "total_received_usdc": 0.0,
+    "avg_latency_ms": 0.0,
 }
-
-COINGECKO_IDS: dict[str, str] = {
-    "SOL": "solana",
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "LINK": "chainlink",
-}
-
-JUPITER_QUOTE_URL = os.getenv("JUPITER_QUOTE_URL", "https://public.jupiterapi.com/quote").strip()
-JUPITER_SWAP_URL = os.getenv("JUPITER_SWAP_URL", "https://public.jupiterapi.com/swap").strip()
-COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
-
-STATE: dict[str, Any] = {
-    "version": APP_VERSION,
-    "started_at": datetime.now(timezone.utc).isoformat(),
-    "last_update": None,
-    "last_error": None,
-    "signals": {},
-    "routes": [],
-    "execution_signal": {"positive": False, "best_route": None, "net_edge_pct": 0.0},
-    "stats": {
-        "total": 0,
-        "approved": 0,
-        "failed": 0,
-        "rejected": 0,
-        "profit_usdc": 0.0,
-        "sponsored_txs": 0,
-    },
-    "history": [],
-}
-
-http_client: httpx.AsyncClient | None = None
+_latency_samples: deque[float] = deque(maxlen=200)
 
 
-def _now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+class ProxyRequest(BaseModel):
+    proxy_url: str
+    target_url: str = "https://httpbin.org/ip"
+    timeout: int = 4
 
 
-def _set_error(msg: str) -> None:
-    STATE["last_error"] = msg
-    print(f"[Robo2 v{APP_VERSION}][ERRO] {msg}", flush=True)
+def record_latency(ms: float) -> None:
+    _latency_samples.append(ms)
+    stats["avg_latency_ms"] = round(sum(_latency_samples) / len(_latency_samples), 2)
 
 
-def _record_op(status: str, route: str, amount: float, detail: str) -> None:
-    STATE["stats"]["total"] += 1
-    if status == "APROVADA":
-        STATE["stats"]["approved"] += 1
-    elif status == "FALHA":
-        STATE["stats"]["failed"] += 1
-    else:
-        STATE["stats"]["rejected"] += 1
+async def verify_solana_usdc_payment(tx_signature: str | None) -> bool:
+    """
+    Consulta a assinatura da transação na RPC da Solana e confirma se houve
+    transferência de USDC para WALLET_ADDRESS com valor >= MIN_USDC_PER_CHECK.
+    """
+    if not tx_signature:
+        return False
 
-    STATE["history"].insert(
-        0,
-        {
-            "status": status,
-            "route": route,
-            "amount": round(amount, 4),
-            "detail": detail,
-            "time": _now_str(),
-        },
-    )
-    del STATE["history"][30:]
+    sig = tx_signature.strip()
+    if len(sig) < 64 or sig in used_proofs:
+        return False
 
-
-def _load_keypair() -> Keypair | None:
-    if not EXECUTOR_PRIVATE_KEY:
-        return None
-    try:
-        return Keypair.from_base58_string(EXECUTOR_PRIVATE_KEY)
-    except Exception as exc:
-        _set_error(f"Chave privada inválida: {exc}")
-        return None
-
-
-async def _rpc_call(method: str, params: list[Any]) -> dict[str, Any]:
-    assert http_client is not None
-    resp = await http_client.post(
-        SOLANA_RPC_URL,
-        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise RuntimeError(str(data["error"]))
-    return data
-
-
-async def _dispatch_transaction(signed_tx_b64: str) -> tuple[str, bool]:
-    assert http_client is not None
-    if KORA_RPC_URL:
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if KORA_API_KEY:
-            headers["x-api-key"] = KORA_API_KEY
-            headers["Authorization"] = f"Bearer {KORA_API_KEY}"
-
-        resp = await http_client.post(
-            KORA_RPC_URL,
-            headers=headers,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "signAndSendTransaction",
-                "params": {"transaction": signed_tx_b64},
-            },
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        if "error" in payload:
-            raise RuntimeError(str(payload["error"]))
-
-        res = payload.get("result", {})
-        tx_sig = str(res.get("signature") or res.get("txSignature") or "") if isinstance(res, dict) else str(res)
-        return tx_sig, True
-
-    send_data = await _rpc_call(
-        "sendTransaction",
-        [
-            signed_tx_b64,
-            {
-                "encoding": "base64",
-                "skipPreflight": False,
-                "preflightCommitment": "confirmed",
-            },
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            sig,
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
         ],
-    )
-    return str(send_data.get("result", "")), False
-
-
-async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str, Any] | None:
-    mint_info = MINTS.get(asset)
-    cg_id = COINGECKO_IDS.get(asset)
-    if not mint_info or not cg_id:
-        return None
-
-    mint, decimals = mint_info
-    one_unit = 10**decimals
-
-    out_usdc: float | None = None
-    ref_price: float | None = None
-    jup_err: Exception | None = None
-
-    try:
-        jup_resp = await client.get(
-            JUPITER_QUOTE_URL,
-            params={
-                "inputMint": mint,
-                "outputMint": USDC_MINT,
-                "amount": str(one_unit),
-                "slippageBps": "10",
-            },
-        )
-        jup_resp.raise_for_status()
-        out_usdc = int(jup_resp.json()["outAmount"]) / 1_000_000
-    except Exception as exc:
-        jup_err = exc
-
-    try:
-        cg_resp = await client.get(
-            COINGECKO_PRICE_URL,
-            params={"ids": cg_id, "vs_currencies": "usd"},
-        )
-        cg_resp.raise_for_status()
-        cg_val = cg_resp.json().get(cg_id, {}).get("usd")
-        if cg_val is not None:
-            ref_price = float(cg_val)
-    except Exception as cg_exc:
-        if out_usdc is None:
-            _set_error(f"Oráculo {asset}: Jupiter ({jup_err}) e CoinGecko ({cg_exc})")
-            return None
-
-    if out_usdc is None and ref_price is None:
-        return None
-
-    if out_usdc is None:
-        out_usdc = ref_price
-    if ref_price is None:
-        ref_price = out_usdc
-
-    if jup_err is not None:
-        _set_error(f"Oráculo {asset} (Jupiter falhou, usando ref): {jup_err}")
-
-    mid = (ref_price + out_usdc) / 2.0
-    bid = min(ref_price, out_usdc)
-    ask = max(ref_price, out_usdc)
-    spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else 0.0
-
-    if spread_pct >= MIN_FISSURE_SPREAD_PCT:
-        fissure = "ALTA"
-        active = True
-    elif spread_pct > 0:
-        fissure = "MODERADA"
-        active = False
-    else:
-        fissure = "NEUTRA"
-        active = False
-
-    return {
-        "asset": asset,
-        "mid": round(mid, 6),
-        "bid": round(bid, 6),
-        "ask": round(ask, 6),
-        "spread_pct": round(spread_pct, 5),
-        "fissure": fissure,
-        "active": active,
-        "updated_at": _now_str(),
     }
 
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                SOLANA_RPC_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=4),
+            ) as resp:
+                data = await resp.json()
 
-def _compute_routes() -> None:
-    routes: list[dict[str, Any]] = []
-    best_route = None
-    best_net = -999.0
+        tx_result = data.get("result")
+        if not tx_result or tx_result.get("meta", {}).get("err") is not None:
+            return False
 
-    for asset, sig in STATE["signals"].items():
-        gross_edge = sig["spread_pct"]
-        net_edge = round(gross_edge - ESTIMATED_COST_PCT, 5)
-        executable = bool(sig["active"] and net_edge >= MIN_POSITIVE_EDGE_PCT)
+        meta = tx_result["meta"]
+        pre_balances = meta.get("preTokenBalances", [])
+        post_balances = meta.get("postTokenBalances", [])
 
-        item = {
-            "route": f"USDC -> {asset} -> USDC",
-            "asset": asset,
-            "fissure": sig["fissure"],
-            "gross_edge_pct": gross_edge,
-            "net_edge_pct": net_edge,
-            "executable": executable,
-        }
-        routes.append(item)
+        pre_map: dict[tuple[int, str], float] = {}
+        for item in pre_balances:
+            if item.get("mint") == USDC_MINT_SOLANA and item.get("owner") == WALLET_ADDRESS:
+                amt = float(item.get("uiTokenAmount", {}).get("uiAmount") or 0.0)
+                pre_map[(item["accountIndex"], USDC_MINT_SOLANA)] = amt
 
-        if executable and net_edge > best_net:
-            best_net = net_edge
-            best_route = item
+        for item in post_balances:
+            if item.get("mint") == USDC_MINT_SOLANA and item.get("owner") == WALLET_ADDRESS:
+                idx = item["accountIndex"]
+                post_amt = float(item.get("uiTokenAmount", {}).get("uiAmount") or 0.0)
+                pre_amt = pre_map.get((idx, USDC_MINT_SOLANA), 0.0)
+                if (post_amt - pre_amt) >= MIN_USDC_PER_CHECK:
+                    used_proofs.add(sig)
+                    stats["total_received_usdc"] = round(
+                        stats["total_received_usdc"] + (post_amt - pre_amt), 6
+                    )
+                    return True
 
-    STATE["routes"] = routes
-    STATE["execution_signal"] = {
-        "positive": best_route is not None,
-        "best_route": best_route,
-        "net_edge_pct": best_net if best_route else 0.0,
-    }
-
-
-class ExecuteRequest(BaseModel):
-    asset: str = Field(default="SOL", description="Ativo alvo: SOL, BTC, ETH ou LINK")
-    notional_usdc: float = Field(default=DEFAULT_NOTIONAL_USDC, gt=0, description="Valor base em USDC")
-    force: bool = Field(default=False, description="Ignora trava de fissura ALTA para teste")
-    dry_run: bool = Field(default=True, description="True = apenas simula na rede sem gastar")
+        return False
+    except Exception:
+        return False
 
 
-async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
-    asset = req.asset.upper().strip()
-    route_label = f"USDC -> {asset} -> USDC"
+@app.post("/v1/verify-proxy")
+async def verify_proxy(
+    payload: ProxyRequest,
+    x_payment_proof: str | None = Header(default=None, alias="X-Payment-Proof"),
+):
+    stats["total_requests"] += 1
 
-    if asset not in MINTS:
-        _record_op("RECUSADA", route_label, req.notional_usdc, "Ativo não suportado")
-        return {"ok": False, "status": "RECUSADA", "reason": "Ativo não suportado"}
+    paid = await verify_solana_usdc_payment(x_payment_proof)
+    if not paid:
+        stats["rejected_402"] += 1
+        recent_events.appendleft({
+            "ts": int(time.time()),
+            "proxy": payload.proxy_url,
+            "status": "402_PAYMENT_REQUIRED",
+            "latency_ms": 0,
+        })
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "Payment Required",
+                "network": "solana-mainnet",
+                "asset": "USDC",
+                "wallet": WALLET_ADDRESS,
+                "min_amount_usdc": MIN_USDC_PER_CHECK,
+                "header": "X-Payment-Proof",
+            },
+        )
 
-    sig = STATE["signals"].get(asset)
-    if not req.force and (not sig or sig["fissure"] != "ALTA"):
-        _record_op("RECUSADA", route_label, req.notional_usdc, "Fissura não está ALTA")
-        return {"ok": False, "status": "RECUSADA", "reason": "Fissura não está ALTA"}
-
-    kp = _load_keypair()
-    if kp is None:
-        _record_op("RECUSADA", route_label, req.notional_usdc, "EXECUTOR_PRIVATE_KEY ausente")
-        return {
-            "ok": False,
-            "status": "RECUSADA",
-            "reason": "Configure EXECUTOR_PRIVATE_KEY nas Environment Variables do Render",
-        }
-
-    assert http_client is not None
-    target_mint, _ = MINTS[asset]
-    amount_in_atomic = int(req.notional_usdc * 1_000_000)
+    stats["paid_requests"] += 1
+    start = time.perf_counter()
 
     try:
-        q1 = await http_client.get(
-            JUPITER_QUOTE_URL,
-            params={
-                "inputMint": USDC_MINT,
-                "outputMint": target_mint,
-                "amount": str(amount_in_atomic),
-                "slippageBps": "15",
-            },
-        )
-        q1.raise_for_status()
-        quote1 = q1.json()
-        mid_amount = int(quote1["outAmount"])
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                payload.target_url,
+                proxy=payload.proxy_url,
+                timeout=aiohttp.ClientTimeout(total=payload.timeout),
+            ) as resp:
+                latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                record_latency(latency_ms)
+                stats["active_proxies"] += 1
 
-        q2 = await http_client.get(
-            JUPITER_QUOTE_URL,
-            params={
-                "inputMint": target_mint,
-                "outputMint": USDC_MINT,
-                "amount": str(mid_amount),
-                "slippageBps": "15",
-            },
-        )
-        q2.raise_for_status()
-        quote2 = q2.json()
-        final_out_usdc = int(quote2["outAmount"]) / 1_000_000
-        expected_profit = round(final_out_usdc - req.notional_usdc, 4)
-
-        if expected_profit < MIN_PROFIT_USDC and not req.force:
-            msg = f"Lucro líquido insuficiente (${expected_profit} < ${MIN_PROFIT_USDC})"
-            _record_op("RECUSADA", route_label, req.notional_usdc, msg)
-            return {"ok": False, "status": "RECUSADA", "reason": msg, "expected_profit_usdc": expected_profit}
-
-        swap_resp = await http_client.post(
-            JUPITER_SWAP_URL,
-            json={
-                "quoteResponse": quote1,
-                "userPublicKey": str(kp.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto",
-            },
-        )
-        swap_resp.raise_for_status()
-        swap_tx_b64 = swap_resp.json()["swapTransaction"]
-
-        raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_tx_b64))
-        signed_tx = VersionedTransaction(raw_tx.message, [kp])
-        signed_tx_b64 = base64.b64encode(bytes(signed_tx)).decode("ascii")
-
-        sim_data = await _rpc_call(
-            "simulateTransaction",
-            [signed_tx_b64, {"encoding": "base64", "commitment": "confirmed"}],
-        )
-        sim_err = sim_data.get("result", {}).get("value", {}).get("err")
-        if sim_err is not None:
-            err_msg = f"Simulação falhou: {sim_err}"
-            _record_op("FALHA", route_label, req.notional_usdc, err_msg)
-            return {"ok": False, "status": "FALHA", "reason": err_msg}
-
-        if req.dry_run:
-            msg = f"Simulação OK | Lucro est.: ${expected_profit}"
-            _record_op("APROVADA", route_label, req.notional_usdc, msg)
-            return {"ok": True, "status": "SIMULADA_OK", "expected_profit_usdc": expected_profit, "detail": msg}
-
-        tx_sig, sponsored = await _dispatch_transaction(signed_tx_b64)
-        if sponsored:
-            STATE["stats"]["sponsored_txs"] += 1
-
-        realized_profit = max(expected_profit, 0.0)
-        STATE["stats"]["profit_usdc"] = round(STATE["stats"]["profit_usdc"] + realized_profit, 4)
-        modo_txt = "KORA" if sponsored else "RPC"
-        msg = f"[{modo_txt}] TX: {tx_sig[:12]}... | Lucro est.: ${expected_profit}"
-        _record_op("APROVADA", route_label, req.notional_usdc, msg)
-        return {
-            "ok": True,
-            "status": "ENVIADA",
-            "sponsored_gas": sponsored,
-            "tx_signature": tx_sig,
-            "expected_profit_usdc": expected_profit,
-        }
+                result = {
+                    "status": "active",
+                    "http_code": resp.status,
+                    "latency_ms": latency_ms,
+                    "verified_at": int(time.time()),
+                }
+                recent_events.appendleft({
+                    "ts": result["verified_at"],
+                    "proxy": payload.proxy_url,
+                    "status": "ACTIVE",
+                    "latency_ms": latency_ms,
+                })
+                return result
 
     except Exception as exc:
-        err_msg = f"Erro na execução: {exc}"
-        _set_error(err_msg)
-        _record_op("FALHA", route_label, req.notional_usdc, err_msg)
-        return {"ok": False, "status": "FALHA", "reason": err_msg}
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        record_latency(latency_ms)
+        stats["dead_proxies"] += 1
+
+        recent_events.appendleft({
+            "ts": int(time.time()),
+            "proxy": payload.proxy_url,
+            "status": f"DEAD ({type(exc).__name__})",
+            "latency_ms": latency_ms,
+        })
+        return {
+            "status": "dead_or_blocked",
+            "error": type(exc).__name__,
+            "latency_ms": latency_ms,
+            "verified_at": int(time.time()),
+        }
 
 
-async def _oracle_loop() -> None:
-    assert http_client is not None
-    while True:
-        start = time.monotonic()
-        updated_any = False
-        for asset in TRACKED_ASSETS:
-            sig = await _fetch_asset_signal(http_client, asset)
-            if sig:
-                STATE["signals"][asset] = sig
-                STATE["last_update"] = sig["updated_at"]
-                updated_any = True
-            await asyncio.sleep(0.4)
-
-        _compute_routes()
-        if updated_any:
-            print(
-                f"[Robo2 v{APP_VERSION}] Ciclo OK ({STATE['last_update']}) | "
-                f"Ativos: {list(STATE['signals'].keys())}",
-                flush=True,
-            )
-
-        exec_sig = STATE["execution_signal"]
-        if AUTO_EXECUTE and exec_sig["positive"] and exec_sig["best_route"]:
-            best_asset = exec_sig["best_route"]["asset"]
-            await execute_arbitrage_onchain(
-                ExecuteRequest(
-                    asset=best_asset,
-                    notional_usdc=DEFAULT_NOTIONAL_USDC,
-                    force=False,
-                    dry_run=False,
-                )
-            )
-
-        elapsed = time.monotonic() - start
-        await asyncio.sleep(max(2.0, POLL_INTERVAL_SEC - elapsed))
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0))
-    task = asyncio.create_task(_oracle_loop())
-    print(
-        f"[Robo2 v{APP_VERSION}] Online | Carteira: {PAY_TO_ADDRESS} | "
-        f"Kora: {bool(KORA_RPC_URL)} | AutoExecute: {AUTO_EXECUTE}",
-        flush=True,
-    )
-    try:
-        yield
-    finally:
-        task.cancel()
-        await http_client.aclose()
-
-
-app = FastAPI(title="Robo2 Signals & Executor", version=APP_VERSION, lifespan=lifespan)
-
-
-@app.get("/health")
-async def health() -> dict[str, Any]:
+@app.get("/api/telemetry")
+async def telemetry():
     return {
-        "status": "ok",
-        "version": APP_VERSION,
-        "wallet_configured": bool(EXECUTOR_PRIVATE_KEY),
-        "kora_configured": bool(KORA_RPC_URL),
-        "auto_execute": AUTO_EXECUTE,
-        "last_update": STATE["last_update"],
-        "last_error": STATE["last_error"],
+        "wallet": WALLET_ADDRESS,
+        "asset": "USDC (Solana)",
+        "stats": stats,
+        "recent_events": list(recent_events),
     }
 
 
-@app.get("/api/status")
-async def api_status() -> JSONResponse:
-    return JSONResponse(STATE)
-
-
-@app.post("/api/v1/execute")
-async def api_execute(req: ExecuteRequest) -> JSONResponse:
-    result = await execute_arbitrage_onchain(req)
-    return JSONResponse(result)
-
-
-@app.get("/", response_class=HTMLResponse)
-async def dashboard() -> str:
-    rows_signals = ""
-    for asset, s in STATE["signals"].items():
-        badge_color = "#16a34a" if s["fissure"] == "ALTA" else "#64748b"
-        rows_signals += f"""
-        <tr>
-            <td><strong>{asset}</strong></td>
-            <td>{s['mid']}</td>
-            <td>{s['bid']}</td>
-            <td>{s['ask']}</td>
-            <td>{s['spread_pct']}%</td>
-            <td><span style="padding:2px 8px;border-radius:999px;background:{badge_color};color:#fff;font-size:12px;">{s['fissure']}</span></td>
-            <td>{s['updated_at']}</td>
-        </tr>
-        """
-    if not rows_signals:
-        rows_signals = '<tr><td colspan="7">Coletando primeiro ciclo...</td></tr>'
-
-    rows_routes = ""
-    for r in STATE["routes"]:
-        status_txt = "ATIVA (EXECUTÁVEL)" if r["executable"] else "AGUARDANDO ALTA"
-        rows_routes += f"""
-        <tr>
-            <td><strong>{r['route']}</strong></td>
-            <td>{r['fissure']}</td>
-            <td>{r['gross_edge_pct']}%</td>
-            <td>{r['net_edge_pct']}%</td>
-            <td>{status_txt}</td>
-        </tr>
-        """
-    if not rows_routes:
-        rows_routes = '<tr><td colspan="5">Nenhuma rota calculada ainda.</td></tr>'
-
-    rows_hist = ""
-    for h in STATE["history"]:
-        rows_hist += f"""
-        <tr>
-            <td><strong>{h['status']}</strong></td>
-            <td>{h['route']}</td>
-            <td>${h['amount']}</td>
-            <td>{h['detail']}</td>
-            <td>{h['time']}</td>
-        </tr>
-        """
-    if not rows_hist:
-        rows_hist = '<tr><td colspan="5">Nenhuma execução registrada ainda.</td></tr>'
-
-    signer_status = "CONFIGURADA" if EXECUTOR_PRIVATE_KEY else "PENDENTE (EXECUTOR_PRIVATE_KEY)"
-    kora_status = "ATIVO (KORA)" if KORA_RPC_URL else "RPC PADRÃO"
-    err_banner = (
-        f'<div class="err"><strong>Último erro:</strong> {STATE["last_error"]}</div>'
-        if STATE["last_error"]
-        else ""
-    )
-
-    return f"""
-    <!doctype html>
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    return """
+    <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
-        <meta charset="utf-8"/>
-        <meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <meta http-equiv="refresh" content="6"/>
-        <title>Robo2 Signals & Executor v{APP_VERSION}</title>
-        <style>
-            * {{ box-sizing: border-box; }}
-            body {{ font-family: system-ui, sans-serif; background: #f8f5ef; color: #1f2937; margin: 14px; }}
-            .card {{ background: #fff; border: 1px solid #e5dccb; border-radius: 10px; padding: 14px; margin-bottom: 14px; }}
-            .err {{ background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; }}
-            .table-wrap {{ width: 100%; overflow-x: auto; }}
-            table {{ width: 100%; min-width: 520px; border-collapse: collapse; font-size: 13px; }}
-            th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #eee; }}
-            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }}
-            .pill {{ background: #dcfce7; color: #166534; padding: 4px 10px; border-radius: 999px; font-weight: 600; font-size: 12px; white-space: nowrap; }}
-            .addr {{ word-break: break-all; font-size: 12px; }}
-        </style>
+      <meta charset="UTF-8" />
+      <title>Monitoramento M2M — Proxy Verifier</title>
+      <style>
+        body { font-family: Arial, sans-serif; background: #111; color: #eee; margin: 24px; }
+        .grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
+        .card { background: #1c1c1c; padding: 16px; border-radius: 8px; border: 1px solid #2e2e2e; }
+        .label { font-size: 12px; color: #aaa; }
+        .val { font-size: 22px; font-weight: bold; margin-top: 6px; }
+        table { width: 100%; border-collapse: collapse; background: #1c1c1c; }
+        th, td { padding: 10px; border-bottom: 1px solid #2e2e2e; text-align: left; font-size: 13px; }
+      </style>
     </head>
     <body>
-        <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
-            <div>
-                <h2 style="margin:0;font-size:18px;">Robo2 Signals & Executor (v{APP_VERSION})</h2>
-                <small>Última leitura: {STATE['last_update'] or '--'} | Fee Payer: {kora_status} | 6s</small>
-            </div>
-            <span class="pill">ONLINE</span>
-        </div>
-        {err_banner}
-        <div class="grid">
-            <div class="card"><small>CARTEIRA RECEBEDORA</small><br><strong class="addr">{PAY_TO_ADDRESS}</strong></div>
-            <div class="card"><small>ASSINATURA ON-CHAIN</small><br><strong>{signer_status}</strong></div>
-            <div class="card"><small>OPERAÇÕES (APROV / FALHA / REC)</small><br><strong>{STATE['stats']['approved']} / {STATE['stats']['failed']} / {STATE['stats']['rejected']}</strong></div>
-            <div class="card"><small>LUCRO ESTIMADO ACUMULADO</small><br><strong>${STATE['stats']['profit_usdc']} USDC</strong></div>
-        </div>
-        <div class="card">
-            <h3>Sinais e Fissuras em Tempo Real</h3>
-            <div class="table-wrap">
-                <table>
-                    <thead><tr><th>ATIVO</th><th>MÉDIO</th><th>BID</th><th>ASK</th><th>SPREAD</th><th>FISSURA</th><th>ATUALIZADO</th></tr></thead>
-                    <tbody>{rows_signals}</tbody>
-                </table>
-            </div>
-        </div>
-        <div class="card">
-            <h3>Rotas de Arbitragem & Gatilho de Execução</h3>
-            <div class="table-wrap">
-                <table>
-                    <thead><tr><th>ROTA</th><th>FISSURA</th><th>EDGE BRUTO</th><th>EDGE LÍQUIDO</th><th>STATUS</th></tr></thead>
-                    <tbody>{rows_routes}</tbody>
-                </table>
-            </div>
-        </div>
-        <div class="card">
-            <h3>Histórico de Execuções (POST /api/v1/execute)</h3>
-            <div class="table-wrap">
-                <table>
-                    <thead><tr><th>STATUS</th><th>ROTA</th><th>VALOR</th><th>DETALHE</th><th>HORÁRIO</th></tr></thead>
-                    <tbody>{rows_hist}</tbody>
-                </table>
-            </div>
-        </div>
+      <h2>Painel em Tempo Real — Proxy Verifier (Hub)</h2>
+      <div id="wallet" style="margin-bottom:16px; color:#9ad;"></div>
+      <div class="grid">
+        <div class="card"><div class="label">Requisições Totais</div><div class="val" id="total">0</div></div>
+        <div class="card"><div class="label">Pagas / Validadas</div><div class="val" id="paid">0</div></div>
+        <div class="card"><div class="label">Bloqueadas (402)</div><div class="val" id="rej">0</div></div>
+        <div class="card"><div class="label">Saldo Acumulado</div><div class="val" id="usdc">$0</div></div>
+        <div class="card"><div class="label">Latência Média</div><div class="val" id="lat">0 ms</div></div>
+      </div>
+      <table>
+        <thead><tr><th>Proxy</th><th>Status</th><th>Latência</th></tr></thead>
+        <tbody id="feed"></tbody>
+      </table>
+      <script>
+        async function refresh() {
+          const r = await fetch('/api/telemetry');
+          const data = await r.json();
+          document.getElementById('wallet').innerText = 'Carteira: ' + data.wallet + ' (' + data.asset + ')';
+          document.getElementById('total').innerText = data.stats.total_requests;
+          document.getElementById('paid').innerText = data.stats.paid_requests;
+          document.getElementById('rej').innerText = data.stats.rejected_402;
+          document.getElementById('usdc').innerText = '$' + data.stats.total_received_usdc;
+          document.getElementById('lat').innerText = data.stats.avg_latency_ms + ' ms';
+          const tbody = document.getElementById('feed');
+          tbody.innerHTML = data.recent_events.map(ev =>
+            `<tr><td>${ev.proxy}</td><td>${ev.status}</td><td>${ev.latency_ms} ms</td></tr>`
+          ).join('');
+        }
+        refresh();
+        setInterval(refresh, 1500);
+      </script>
     </body>
     </html>
     """
