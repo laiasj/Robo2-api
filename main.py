@@ -16,7 +16,7 @@ from solders.transaction import VersionedTransaction
 # ==============================================================================
 # CONFIGURAÇÃO & VARIÁVEIS DE AMBIENTE (RENDER)
 # ==============================================================================
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.3.1"
 
 PAY_TO_ADDRESS = (
     os.getenv("PAY_TO_ADDRESS")
@@ -25,15 +25,12 @@ PAY_TO_ADDRESS = (
     or "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk"
 ).strip()
 
-# Chave privada Base58 da carteira executora (configure SOMENTE nas Env Vars do Render)
 EXECUTOR_PRIVATE_KEY = os.getenv("EXECUTOR_PRIVATE_KEY", "").strip()
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
 
-# Endpoint JSON-RPC do Kora (ex.: https://seu-kora.onrender.com) e chave opcional
 KORA_RPC_URL = (os.getenv("KORA_RPC_URL") or os.getenv("GASLESS_SPONSOR_URL") or "").strip()
 KORA_API_KEY = (os.getenv("KORA_API_KEY") or os.getenv("GASLESS_SPONSOR_API_KEY") or "").strip()
 
-# Parâmetros de gatilho e risco
 MIN_FISSURE_SPREAD_PCT = float(os.getenv("MIN_FISSURE_SPREAD_PCT", "0.015"))
 MIN_POSITIVE_EDGE_PCT = float(os.getenv("MIN_POSITIVE_EDGE_PCT", "0.02"))
 ESTIMATED_COST_PCT = float(os.getenv("ESTIMATED_COST_PCT", "0.01"))
@@ -67,9 +64,6 @@ JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 
-# ==============================================================================
-# ESTADO EM MEMÓRIA
-# ==============================================================================
 STATE: dict[str, Any] = {
     "version": APP_VERSION,
     "started_at": datetime.now(timezone.utc).isoformat(),
@@ -94,6 +88,11 @@ http_client: httpx.AsyncClient | None = None
 
 def _now_str() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+
+def _set_error(msg: str) -> None:
+    STATE["last_error"] = msg
+    print(f"[Robo2 v{APP_VERSION}][ERRO] {msg}", flush=True)
 
 
 def _record_op(status: str, route: str, amount: float, detail: str) -> None:
@@ -124,7 +123,7 @@ def _load_keypair() -> Keypair | None:
     try:
         return Keypair.from_base58_string(EXECUTOR_PRIVATE_KEY)
     except Exception as exc:
-        STATE["last_error"] = f"Chave privada inválida: {exc}"
+        _set_error(f"Chave privada inválida: {exc}")
         return None
 
 
@@ -142,7 +141,6 @@ async def _rpc_call(method: str, params: list[Any]) -> dict[str, Any]:
 
 
 async def _dispatch_transaction(signed_tx_b64: str) -> tuple[str, bool]:
-    """Envia via nó Kora (JSON-RPC 2.0) se configurado; caso contrário, usa RPC da Solana."""
     assert http_client is not None
     if KORA_RPC_URL:
         headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -166,10 +164,7 @@ async def _dispatch_transaction(signed_tx_b64: str) -> tuple[str, bool]:
             raise RuntimeError(str(payload["error"]))
 
         res = payload.get("result", {})
-        if isinstance(res, dict):
-            tx_sig = str(res.get("signature") or res.get("txSignature") or "")
-        else:
-            tx_sig = str(res)
+        tx_sig = str(res.get("signature") or res.get("txSignature") or "") if isinstance(res, dict) else str(res)
         return tx_sig, True
 
     send_data = await _rpc_call(
@@ -186,9 +181,6 @@ async def _dispatch_transaction(signed_tx_b64: str) -> tuple[str, bool]:
     return str(send_data.get("result", "")), False
 
 
-# ==============================================================================
-# ORÁCULO: COLETA RÁPIDA DE PREÇOS E SPREADS
-# ==============================================================================
 async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str, Any] | None:
     mint_info = MINTS.get(asset)
     cg_id = COINGECKO_IDS.get(asset)
@@ -199,13 +191,6 @@ async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str
     one_unit = 10**decimals
 
     try:
-        cg_resp = await client.get(
-            COINGECKO_PRICE_URL,
-            params={"ids": cg_id, "vs_currencies": "usd"},
-        )
-        cg_resp.raise_for_status()
-        ref_price = float(cg_resp.json()[cg_id]["usd"])
-
         jup_resp = await client.get(
             JUPITER_QUOTE_URL,
             params={
@@ -217,6 +202,19 @@ async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str
         )
         jup_resp.raise_for_status()
         out_usdc = int(jup_resp.json()["outAmount"]) / 1_000_000
+
+        ref_price = out_usdc
+        try:
+            cg_resp = await client.get(
+                COINGECKO_PRICE_URL,
+                params={"ids": cg_id, "vs_currencies": "usd"},
+            )
+            cg_resp.raise_for_status()
+            cg_val = cg_resp.json().get(cg_id, {}).get("usd")
+            if cg_val is not None:
+                ref_price = float(cg_val)
+        except Exception as cg_exc:
+            print(f"[Robo2 v{APP_VERSION}][AVISO] CoinGecko {asset} falhou ({cg_exc}), usando Jupiter", flush=True)
 
         mid = (ref_price + out_usdc) / 2.0
         bid = min(ref_price, out_usdc)
@@ -244,7 +242,7 @@ async def _fetch_asset_signal(client: httpx.AsyncClient, asset: str) -> dict[str
             "updated_at": _now_str(),
         }
     except Exception as exc:
-        STATE["last_error"] = f"{asset}: {exc}"
+        _set_error(f"Oráculo {asset}: {exc}")
         return None
 
 
@@ -280,9 +278,6 @@ def _compute_routes() -> None:
     }
 
 
-# ==============================================================================
-# EXECUTOR ATÔMICO ON-CHAIN (SIMULAÇÃO + KORA PAYMASTER)
-# ==============================================================================
 class ExecuteRequest(BaseModel):
     asset: str = Field(default="SOL", description="Ativo alvo: SOL, BTC, ETH ou LINK")
     notional_usdc: float = Field(default=DEFAULT_NOTIONAL_USDC, gt=0, description="Valor base em USDC")
@@ -347,12 +342,7 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
         if expected_profit < MIN_PROFIT_USDC and not req.force:
             msg = f"Lucro líquido insuficiente (${expected_profit} < ${MIN_PROFIT_USDC})"
             _record_op("RECUSADA", route_label, req.notional_usdc, msg)
-            return {
-                "ok": False,
-                "status": "RECUSADA",
-                "reason": msg,
-                "expected_profit_usdc": expected_profit,
-            }
+            return {"ok": False, "status": "RECUSADA", "reason": msg, "expected_profit_usdc": expected_profit}
 
         swap_resp = await http_client.post(
             JUPITER_SWAP_URL,
@@ -384,12 +374,7 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
         if req.dry_run:
             msg = f"Simulação OK | Lucro est.: ${expected_profit}"
             _record_op("APROVADA", route_label, req.notional_usdc, msg)
-            return {
-                "ok": True,
-                "status": "SIMULADA_OK",
-                "expected_profit_usdc": expected_profit,
-                "detail": msg,
-            }
+            return {"ok": True, "status": "SIMULADA_OK", "expected_profit_usdc": expected_profit, "detail": msg}
 
         tx_sig, sponsored = await _dispatch_transaction(signed_tx_b64)
         if sponsored:
@@ -410,25 +395,31 @@ async def execute_arbitrage_onchain(req: ExecuteRequest) -> dict[str, Any]:
 
     except Exception as exc:
         err_msg = f"Erro na execução: {exc}"
+        _set_error(err_msg)
         _record_op("FALHA", route_label, req.notional_usdc, err_msg)
         return {"ok": False, "status": "FALHA", "reason": err_msg}
 
 
-# ==============================================================================
-# LOOP EM SEGUNDO PLANO
-# ==============================================================================
 async def _oracle_loop() -> None:
     assert http_client is not None
     while True:
         start = time.monotonic()
+        updated_any = False
         for asset in TRACKED_ASSETS:
             sig = await _fetch_asset_signal(http_client, asset)
             if sig:
                 STATE["signals"][asset] = sig
                 STATE["last_update"] = sig["updated_at"]
-            await asyncio.sleep(0.35)
+                updated_any = True
+            await asyncio.sleep(0.4)
 
         _compute_routes()
+        if updated_any:
+            print(
+                f"[Robo2 v{APP_VERSION}] Ciclo OK ({STATE['last_update']}) | "
+                f"Ativos: {list(STATE['signals'].keys())}",
+                flush=True,
+            )
 
         exec_sig = STATE["execution_signal"]
         if AUTO_EXECUTE and exec_sig["positive"] and exec_sig["best_route"]:
@@ -443,17 +434,18 @@ async def _oracle_loop() -> None:
             )
 
         elapsed = time.monotonic() - start
-        await asyncio.sleep(max(1.0, POLL_INTERVAL_SEC - elapsed))
+        await asyncio.sleep(max(2.0, POLL_INTERVAL_SEC - elapsed))
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0))
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0))
     task = asyncio.create_task(_oracle_loop())
     print(
         f"[Robo2 v{APP_VERSION}] Online | Carteira: {PAY_TO_ADDRESS} | "
-        f"Kora: {bool(KORA_RPC_URL)} | AutoExecute: {AUTO_EXECUTE}"
+        f"Kora: {bool(KORA_RPC_URL)} | AutoExecute: {AUTO_EXECUTE}",
+        flush=True,
     )
     try:
         yield
@@ -465,9 +457,6 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Robo2 Signals & Executor", version=APP_VERSION, lifespan=lifespan)
 
 
-# ==============================================================================
-# ROTAS API & PAINEL
-# ==============================================================================
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {
@@ -523,6 +512,8 @@ async def dashboard() -> str:
             <td>{status_txt}</td>
         </tr>
         """
+    if not rows_routes:
+        rows_routes = '<tr><td colspan="5">Nenhuma rota calculada ainda.</td></tr>'
 
     rows_hist = ""
     for h in STATE["history"]:
@@ -538,63 +529,76 @@ async def dashboard() -> str:
     if not rows_hist:
         rows_hist = '<tr><td colspan="5">Nenhuma execução registrada ainda.</td></tr>'
 
-    signer_status = "CONFIGURADA" if EXECUTOR_PRIVATE_KEY else "PENDENTE (Env Var EXECUTOR_PRIVATE_KEY)"
+    signer_status = "CONFIGURADA" if EXECUTOR_PRIVATE_KEY else "PENDENTE (EXECUTOR_PRIVATE_KEY)"
     kora_status = "ATIVO (KORA)" if KORA_RPC_URL else "RPC PADRÃO"
+    err_banner = (
+        f'<div class="err"><strong>Último erro:</strong> {STATE["last_error"]}</div>'
+        if STATE["last_error"]
+        else ""
+    )
 
     return f"""
     <!doctype html>
     <html lang="pt-BR">
     <head>
         <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1"/>
         <meta http-equiv="refresh" content="6"/>
         <title>Robo2 Signals & Executor v{APP_VERSION}</title>
         <style>
-            body {{ font-family: system-ui, sans-serif; background: #f8f5ef; color: #1f2937; margin: 24px; }}
-            .card {{ background: #fff; border: 1px solid #e5dccb; border-radius: 10px; padding: 16px; margin-bottom: 16px; }}
-            table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+            * {{ box-sizing: border-box; }}
+            body {{ font-family: system-ui, sans-serif; background: #f8f5ef; color: #1f2937; margin: 14px; }}
+            .card {{ background: #fff; border: 1px solid #e5dccb; border-radius: 10px; padding: 14px; margin-bottom: 14px; }}
+            .err {{ background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; }}
+            .table-wrap {{ width: 100%; overflow-x: auto; }}
+            table {{ width: 100%; min-width: 520px; border-collapse: collapse; font-size: 13px; }}
             th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #eee; }}
-            .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }}
-            .pill {{ background: #dcfce7; color: #166534; padding: 4px 10px; border-radius: 999px; font-weight: 600; font-size: 12px; }}
+            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }}
+            .pill {{ background: #dcfce7; color: #166534; padding: 4px 10px; border-radius: 999px; font-weight: 600; font-size: 12px; white-space: nowrap; }}
+            .addr {{ word-break: break-all; font-size: 12px; }}
         </style>
     </head>
     <body>
-        <div class="card" style="display:flex;justify-content:space-between;align-items:center;">
+        <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
             <div>
-                <h2 style="margin:0;">Robo2 Signals & Executor (v{APP_VERSION})</h2>
-                <small>Última leitura: {STATE['last_update'] or '--'} | Fee Payer: {kora_status} | Atualização a cada 6s</small>
+                <h2 style="margin:0;font-size:18px;">Robo2 Signals & Executor (v{APP_VERSION})</h2>
+                <small>Última leitura: {STATE['last_update'] or '--'} | Fee Payer: {kora_status} | 6s</small>
             </div>
             <span class="pill">ONLINE</span>
         </div>
-
+        {err_banner}
         <div class="grid">
-            <div class="card"><small>CARTEIRA RECEBEDORA</small><br><strong style="font-size:12px;">{PAY_TO_ADDRESS}</strong></div>
+            <div class="card"><small>CARTEIRA RECEBEDORA</small><br><strong class="addr">{PAY_TO_ADDRESS}</strong></div>
             <div class="card"><small>ASSINATURA ON-CHAIN</small><br><strong>{signer_status}</strong></div>
             <div class="card"><small>OPERAÇÕES (APROV / FALHA / REC)</small><br><strong>{STATE['stats']['approved']} / {STATE['stats']['failed']} / {STATE['stats']['rejected']}</strong></div>
             <div class="card"><small>LUCRO ESTIMADO ACUMULADO</small><br><strong>${STATE['stats']['profit_usdc']} USDC</strong></div>
         </div>
-
         <div class="card">
             <h3>Sinais e Fissuras em Tempo Real</h3>
-            <table>
-                <thead><tr><th>ATIVO</th><th>MÉDIO</th><th>BID</th><th>ASK</th><th>SPREAD</th><th>FISSURA</th><th>ATUALIZADO</th></tr></thead>
-                <tbody>{rows_signals}</tbody>
-            </table>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>ATIVO</th><th>MÉDIO</th><th>BID</th><th>ASK</th><th>SPREAD</th><th>FISSURA</th><th>ATUALIZADO</th></tr></thead>
+                    <tbody>{rows_signals}</tbody>
+                </table>
+            </div>
         </div>
-
         <div class="card">
             <h3>Rotas de Arbitragem & Gatilho de Execução</h3>
-            <table>
-                <thead><tr><th>ROTA</th><th>FISSURA</th><th>EDGE BRUTO</th><th>EDGE LÍQUIDO</th><th>STATUS</th></tr></thead>
-                <tbody>{rows_routes}</tbody>
-            </table>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>ROTA</th><th>FISSURA</th><th>EDGE BRUTO</th><th>EDGE LÍQUIDO</th><th>STATUS</th></tr></thead>
+                    <tbody>{rows_routes}</tbody>
+                </table>
+            </div>
         </div>
-
         <div class="card">
             <h3>Histórico de Execuções (POST /api/v1/execute)</h3>
-            <table>
-                <thead><tr><th>STATUS</th><th>ROTA</th><th>VALOR</th><th>DETALHE</th><th>HORÁRIO</th></tr></thead>
-                <tbody>{rows_hist}</tbody>
-            </table>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>STATUS</th><th>ROTA</th><th>VALOR</th><th>DETALHE</th><th>HORÁRIO</th></tr></thead>
+                    <tbody>{rows_hist}</tbody>
+                </table>
+            </div>
         </div>
     </body>
     </html>
