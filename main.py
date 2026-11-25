@@ -1,405 +1,135 @@
-import asyncio
 import os
 import time
-from collections import deque
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel
-import aiohttp
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime
+from web3 import Web3
+import requests
 
-# === CARTEIRA SOLANA, COBRANÇA USDC E DESCOBERTA ===
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "AmghkwYE3bruzjnxdZ3fGRgpmqHx1EDbWVU2vuMnqNAk")
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-USDC_MINT_SOLANA = os.getenv("USDC_MINT_SOLANA", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-MIN_USDC_PER_CHECK = float(os.getenv("MIN_USDC_PER_CHECK", "0.0005"))
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
-ANNOUNCE_INTERVAL_SEC = int(os.getenv("ANNOUNCE_INTERVAL_SEC", "300"))
-ANNOUNCE_URLS = [
-    u.strip() for u in os.getenv("ANNOUNCE_URLS", "").split(",") if u.strip()
+# =========================================================================
+# LABORATÓRIO M2M KEEPER EXCLUSIVO BASE - VERSÃO DE TESTE 24/7 NO RENDER
+# =========================================================================
+COTACAO_BRL = 5.80
+MARGEM_MINIMA_LUCRO_USD = 0.015
+TETO_SANIDADE_REWARD_USD = 8.00
+COOLDOWN_SEGUNDOS = 3600         # 1 hora de trava por cofre (zero duplicidade)
+RPC_BASE = os.getenv("RPC_BASE", "https://mainnet.base.org")
+PRECO_ETH_USD = 3200.00
+LIMITE_COFRES = 500              # Varre 100% dos cofres ativos da Base
+
+ENDERECO_SIMULADOR = Web3.to_checksum_address("0x000000000000000000000000000000000000dEaD")
+
+ABI_ESTRATEGIA = [
+    {"inputs": [], "name": "callReward", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "lastHarvest", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "paused", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "harvest", "outputs": [], "stateMutability": "nonpayable", "type": "function"}
 ]
 
-# === ESTADO EM TEMPO REAL ===
-used_proofs: set[str] = set()
-recent_events: deque[dict] = deque(maxlen=60)
-_latency_samples: deque[float] = deque(maxlen=200)
+# Servidor HTTP leve para manter o Web Service ativo no Render sem erro de porta
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Base M2M Keeper Lab Online")
+    def log_message(self, format, *args):
+        pass
 
-daily_tracker = {
-    "day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-    "daily_transactions": 0,
-}
+def iniciar_servidor_health():
+    porta = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", porta), HealthHandler)
+    server.serve_forever()
 
-stats = {
-    "total_requests": 0,
-    "approved_tx": 0,
-    "denied_402": 0,
-    "error_tx": 0,
-    "active_proxies": 0,
-    "dead_proxies": 0,
-    "total_received_usdc": 0.0,
-    "avg_latency_ms": 0.0,
-}
-
-
-class ProxyRequest(BaseModel):
-    proxy_url: str
-    target_url: str = "https://httpbin.org/ip"
-    timeout: int = 4
-
-
-def touch_daily_counter() -> int:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if daily_tracker["day"] != today:
-        daily_tracker["day"] = today
-        daily_tracker["daily_transactions"] = 0
-    daily_tracker["daily_transactions"] += 1
-    return daily_tracker["daily_transactions"]
-
-
-def get_daily_count() -> int:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if daily_tracker["day"] != today:
-        daily_tracker["day"] = today
-        daily_tracker["daily_transactions"] = 0
-    return daily_tracker["daily_transactions"]
-
-
-def record_latency(ms: float) -> None:
-    _latency_samples.append(ms)
-    stats["avg_latency_ms"] = round(sum(_latency_samples) / len(_latency_samples), 2)
-
-
-def service_metadata() -> dict:
-    base = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else ""
-    return {
-        "service": "M2M Proxy Verifier",
-        "protocol": "HTTP-402",
-        "network": "solana-mainnet",
-        "asset": "USDC",
-        "usdc_mint": USDC_MINT_SOLANA,
-        "wallet": WALLET_ADDRESS,
-        "price_per_check_usdc": MIN_USDC_PER_CHECK,
-        "payment_header": "X-Payment-Proof",
-        "verify_endpoint": f"{base}/v1/verify-proxy" if base else "/v1/verify-proxy",
-        "telemetry_endpoint": f"{base}/api/telemetry" if base else "/api/telemetry",
-        "avg_latency_ms": stats["avg_latency_ms"],
-    }
-
-
-async def announce_once() -> None:
-    if not ANNOUNCE_URLS:
-        return
-    payload = service_metadata()
-    async with aiohttp.ClientSession() as session:
-        for url in ANNOUNCE_URLS:
-            try:
-                async with session.post(
-                    url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    _ = await resp.text()
-            except Exception:
-                pass
-
-
-async def announcement_loop() -> None:
-    while True:
-        await announce_once()
-        await asyncio.sleep(max(30, ANNOUNCE_INTERVAL_SEC))
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(announcement_loop())
+def carregar_cofres_base():
+    lista_est = []
     try:
-        yield
-    finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-
-app = FastAPI(title="Hub M2M Proxy Verifier", lifespan=lifespan)
-
-
-async def verify_solana_usdc_payment(tx_signature: str | None) -> tuple[bool, str]:
-    """
-    Valida transação real na RPC da Solana:
-    - (True, "APPROVED") quando transfere >= MIN_USDC_PER_CHECK em USDC para WALLET_ADDRESS
-    - (False, "DENIED") quando assinatura ausente, inválida, já utilizada ou sem valor suficiente
-    - (False, "ERROR") quando houver falha de rede/RPC
-    """
-    if not tx_signature or len(tx_signature.strip()) < 64:
-        return False, "DENIED"
-
-    sig = tx_signature.strip()
-    if sig in used_proofs:
-        return False, "DENIED"
-
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [
-            sig,
-            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
-        ],
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                SOLANA_RPC_URL,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=4),
-            ) as resp:
-                if resp.status >= 500:
-                    return False, "ERROR"
-                data = await resp.json()
-
-        if "error" in data:
-            return False, "ERROR"
-
-        tx_result = data.get("result")
-        if not tx_result:
-            return False, "DENIED"
-
-        if tx_result.get("meta", {}).get("err") is not None:
-            return False, "DENIED"
-
-        meta = tx_result["meta"]
-        pre_balances = meta.get("preTokenBalances", [])
-        post_balances = meta.get("postTokenBalances", [])
-
-        pre_map: dict[tuple[int, str], float] = {}
-        for item in pre_balances:
-            if item.get("mint") == USDC_MINT_SOLANA and item.get("owner") == WALLET_ADDRESS:
-                amt = float(item.get("uiTokenAmount", {}).get("uiAmount") or 0.0)
-                pre_map[(item["accountIndex"], USDC_MINT_SOLANA)] = amt
-
-        for item in post_balances:
-            if item.get("mint") == USDC_MINT_SOLANA and item.get("owner") == WALLET_ADDRESS:
-                idx = item["accountIndex"]
-                post_amt = float(item.get("uiTokenAmount", {}).get("uiAmount") or 0.0)
-                pre_amt = pre_map.get((idx, USDC_MINT_SOLANA), 0.0)
-                delta = post_amt - pre_amt
-                if delta >= MIN_USDC_PER_CHECK:
-                    used_proofs.add(sig)
-                    stats["total_received_usdc"] = round(
-                        stats["total_received_usdc"] + delta, 6
-                    )
-                    return True, "APPROVED"
-
-        return False, "DENIED"
+        resp = requests.get("https://api.beefy.finance/vaults/base", timeout=10)
+        if resp.status_code == 200:
+            for v in resp.json():
+                if v.get("status") == "active" and v.get("strategy"):
+                    try:
+                        lista_est.append({
+                            "nome": v.get("name", v.get("id")),
+                            "endereco": Web3.to_checksum_address(v["strategy"])
+                        })
+                    except Exception:
+                        continue
     except Exception:
-        return False, "ERROR"
+        pass
+    return lista_est[:LIMITE_COFRES]
 
+def executar_laboratorio():
+    w3 = Web3(Web3.HTTPProvider(RPC_BASE, request_kwargs={"timeout": 8}))
+    estrategias_base = carregar_cofres_base()
 
-@app.get("/")
-async def root():
-    return RedirectResponse(url="/dashboard")
+    print("==========================================================================================", flush=True)
+    print("🔵 RENDER LAB — KEEPER EXCLUSIVO REDE BASE MAINNET (MODO AUDITORIA 24/7)", flush=True)
+    print(f"🔗 Conexão Base: {w3.is_connected()} | Total de Cofres Ativos na Base: {len(estrategias_base)}", flush=True)
+    print("==========================================================================================\n", flush=True)
 
+    estado = {"total_colheitas": 0, "lucro_total_usd": 0.0, "historico_ts": {}}
+    ciclo = 0
 
-@app.get("/v1/info")
-async def info():
-    return service_metadata()
+    while True:
+        ciclo += 1
+        inicio_ciclo = time.time()
+        hora = datetime.now().strftime("%H:%M:%S")
+        agora_ts = int(inicio_ciclo)
 
+        if ciclo % 60 == 0 or not estrategias_base:
+            estrategias_base = carregar_cofres_base()
 
-@app.post("/v1/verify-proxy")
-async def verify_proxy(
-    payload: ProxyRequest,
-    x_payment_proof: str | None = Header(default=None, alias="X-Payment-Proof"),
-):
-    stats["total_requests"] += 1
-    daily_now = touch_daily_counter()
-    now_ts = int(time.time())
+        if not w3.is_connected():
+            time.sleep(5)
+            continue
 
-    paid, outcome = await verify_solana_usdc_payment(x_payment_proof)
-    if not paid:
-        if outcome == "ERROR":
-            stats["error_tx"] += 1
-            recent_events.appendleft({
-                "ts": now_ts,
-                "proxy": payload.proxy_url,
-                "category": "ERRO",
-                "status": "RPC_OR_PAYMENT_ERROR",
-                "latency_ms": 0,
-            })
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "Payment verification temporary error", "daily_transactions": daily_now},
-            )
+        try:
+            bloco = w3.eth.block_number
+            gas_price_wei = w3.eth.gas_price
+        except Exception:
+            time.sleep(5)
+            continue
 
-        stats["denied_402"] += 1
-        recent_events.appendleft({
-            "ts": now_ts,
-            "proxy": payload.proxy_url,
-            "category": "NEGADA",
-            "status": "402_PAYMENT_REQUIRED",
-            "latency_ms": 0,
-        })
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "error": "Payment Required",
-                "network": "solana-mainnet",
-                "asset": "USDC",
-                "usdc_mint": USDC_MINT_SOLANA,
-                "wallet": WALLET_ADDRESS,
-                "min_amount_usdc": MIN_USDC_PER_CHECK,
-                "header": "X-Payment-Proof",
-            },
-        )
+        novas_no_ciclo = 0
 
-    stats["approved_tx"] += 1
-    start = time.perf_counter()
+        for est in estrategias_base:
+            endereco = est["endereco"]
+            if agora_ts - estado["historico_ts"].get(endereco, 0) < COOLDOWN_SEGUNDOS:
+                continue
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                payload.target_url,
-                proxy=payload.proxy_url,
-                timeout=aiohttp.ClientTimeout(total=payload.timeout),
-            ) as resp:
-                latency_ms = round((time.perf_counter() - start) * 1000, 2)
-                record_latency(latency_ms)
-                stats["active_proxies"] += 1
+            try:
+                contrato = w3.eth.contract(address=endereco, abi=ABI_ESTRATEGIA)
+                if contrato.functions.paused().call():
+                    continue
+                if agora_ts - contrato.functions.lastHarvest().call() < 600:
+                    continue
 
-                recent_events.appendleft({
-                    "ts": int(time.time()),
-                    "proxy": payload.proxy_url,
-                    "category": "APROVADA",
-                    "status": f"ACTIVE ({resp.status})",
-                    "latency_ms": latency_ms,
-                })
-                return {
-                    "status": "active",
-                    "http_code": resp.status,
-                    "latency_ms": latency_ms,
-                    "daily_transactions": daily_now,
-                    "verified_at": int(time.time()),
-                }
+                reward_wei = contrato.functions.callReward().call()
+                if reward_wei <= 0:
+                    continue
 
-    except Exception as exc:
-        latency_ms = round((time.perf_counter() - start) * 1000, 2)
-        record_latency(latency_ms)
-        stats["dead_proxies"] += 1
-        stats["error_tx"] += 1
+                reward_usd = (reward_wei / 1e18) * PRECO_ETH_USD
+                if reward_usd > TETO_SANIDADE_REWARD_USD:
+                    continue
 
-        recent_events.appendleft({
-            "ts": int(time.time()),
-            "proxy": payload.proxy_url,
-            "category": "ERRO",
-            "status": f"PROXY_ERROR ({type(exc).__name__})",
-            "latency_ms": latency_ms,
-        })
-        return {
-            "status": "dead_or_blocked",
-            "error": type(exc).__name__,
-            "latency_ms": latency_ms,
-            "daily_transactions": daily_now,
-            "verified_at": int(time.time()),
-        }
+                gas_estimado = contrato.functions.harvest().estimate_gas({"from": ENDERECO_SIMULADOR})
+                custo_gas_usd = ((gas_price_wei * gas_estimado) / 1e18) * PRECO_ETH_USD
+                lucro_liquido = reward_usd - custo_gas_usd
 
+                if lucro_liquido >= MARGEM_MINIMA_LUCRO_USD:
+                    estado["historico_ts"][endereco] = agora_ts
+                    estado["total_colheitas"] += 1
+                    estado["lucro_total_usd"] += lucro_liquido
+                    novas_no_ciclo += 1
 
-@app.get("/api/telemetry")
-async def telemetry():
-    return {
-        "wallet": WALLET_ADDRESS,
-        "asset": "USDC (Solana)",
-        "daily_transactions": get_daily_count(),
-        "stats": stats,
-        "recent_events": list(recent_events),
-    }
+                    print(f"💧 [BASE] {est['nome'][:28]:<28} | Recomp.: US$ {reward_usd:.3f} | Gas: US$ {custo_gas_usd:.4f} | LÍQUIDO: +US$ {lucro_liquido:.3f} (R$ {lucro_liquido * COTACAO_BRL:.2f})", flush=True)
+            except Exception:
+                continue
 
+        duracao = time.time() - inicio_ciclo
+        print(f"[{hora}] 🔄 Ciclo #{ciclo} concluído em {duracao:.1f}s | Bloco #{bloco} | Novas: {novas_no_ciclo} | Total: {estado['total_colheitas']} (US$ {estado['lucro_total_usd']:.2f} / R$ {estado['lucro_total_usd'] * COTACAO_BRL:.2f})", flush=True)
+        time.sleep(8)
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    return """
-    <!DOCTYPE html>
-    <html lang="pt-BR">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>Painel M2M em Tempo Real</title>
-      <style>
-        body { font-family: Arial, sans-serif; background: #0e1015; color: #f1f5f9; margin: 20px; }
-        .top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
-        .wallet { font-size: 13px; color: #93c5fd; word-break: break-all; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 20px; }
-        .card { background: #171b24; padding: 14px; border-radius: 10px; border: 1px solid #283042; }
-        .label { font-size: 12px; color: #94a3b8; }
-        .val { font-size: 24px; font-weight: bold; margin-top: 6px; }
-        .ok { color: #4ade80; }
-        .neg { color: #fbbf24; }
-        .err { color: #f87171; }
-        table { width: 100%; border-collapse: collapse; background: #171b24; border-radius: 10px; overflow: hidden; }
-        th, td { padding: 10px 12px; border-bottom: 1px solid #283042; text-align: left; font-size: 13px; }
-        th { background: #1e2430; color: #cbd5e1; }
-      </style>
-    </head>
-    <body>
-      <div class="top">
-        <h2 style="margin:0;">Monitoramento de Transações em Tempo Real</h2>
-        <div class="wallet" id="wallet">Carregando carteira...</div>
-      </div>
-      <div class="grid">
-        <div class="card"><div class="label">Transações Hoje (Dia)</div><div class="val" id="daily">0</div></div>
-        <div class="card"><div class="label">Aprovadas</div><div class="val ok" id="approved">0</div></div>
-        <div class="card"><div class="label">Negadas (402)</div><div class="val neg" id="denied">0</div></div>
-        <div class="card"><div class="label">Com Erro</div><div class="val err" id="errors">0</div></div>
-        <div class="card"><div class="label">USDC Acumulado</div><div class="val ok" id="usdc">$0</div></div>
-        <div class="card"><div class="label">Latência Média</div><div class="val" id="lat">0 ms</div></div>
-      </div>
-      <table>
-        <thead>
-          <tr><th>Hora</th><th>Proxy</th><th>Tipo</th><th>Detalhe</th><th>Latência</th></tr>
-        </thead>
-        <tbody id="feed"></tbody>
-      </table>
-      <script>
-        function fmtTime(ts) {
-          if (!ts) return '-';
-          return new Date(ts * 1000).toLocaleTimeString('pt-BR');
-        }
-        async function refresh() {
-          try {
-            const r = await fetch('/api/telemetry', { cache: 'no-store' });
-            const data = await r.json();
-            document.getElementById('wallet').innerText = 'Carteira: ' + data.wallet + ' (' + data.asset + ')';
-            document.getElementById('daily').innerText = data.daily_transactions;
-            document.getElementById('approved').innerText = data.stats.approved_tx;
-            document.getElementById('denied').innerText = data.stats.denied_402;
-            document.getElementById('errors').innerText = data.stats.error_tx;
-            document.getElementById('usdc').innerText = '$' + data.stats.total_received_usdc;
-            document.getElementById('lat').innerText = data.stats.avg_latency_ms + ' ms';
-
-            const tbody = document.getElementById('feed');
-            if (!data.recent_events.length) {
-              tbody.innerHTML = '<tr><td colspan="5">Nenhuma transação registrada ainda.</td></tr>';
-              return;
-            }
-            tbody.innerHTML = data.recent_events.map(ev => {
-              const cls = ev.category === 'APROVADA' ? 'ok' : (ev.category === 'NEGADA' ? 'neg' : 'err');
-              return `<tr>
-                <td>${fmtTime(ev.ts)}</td>
-                <td>${ev.proxy}</td>
-                <td class="${cls}"><strong>${ev.category}</strong></td>
-                <td>${ev.status}</td>
-                <td>${ev.latency_ms} ms</td>
-              </tr>`;
-            }).join('');
-          } catch (e) {
-            console.error(e);
-          }
-        }
-        refresh();
-        setInterval(refresh, 1500);
-      </script>
-    </body>
-    </html>
-    """
+if __name__ == "__main__":
+    threading.Thread(target=iniciar_servidor_health, daemon=True).start()
+    executar_laboratorio()
