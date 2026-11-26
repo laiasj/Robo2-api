@@ -25,9 +25,14 @@ COTACAO_BRL = 5.80
 MARGEM_MINIMA_LUCRO_USD = 0.03
 TETO_ATAQUE_LUCRO_USD = 1.50       # Ignora prêmios > US$ 1.50 para evitar guerra MEV e revert
 DESCONTO_SLIPPAGE_REAL = 0.85      # Desconta 15% de perda na troca interna do harvest
-PERCENTUAL_GORJETA_BASE = 0.15     # 15% até US$ 0.59
+
+# Escalonamento da gorjeta dinâmica em 3 degraus
+PERCENTUAL_GORJETA_MICRO = 0.075   # 7,5% de US$ 0.03 até US$ 0.10
+LIMIAR_GORJETA_MICRO_USD = 0.10
+PERCENTUAL_GORJETA_BASE = 0.15     # 15% acima de US$ 0.10 até US$ 0.59
 PERCENTUAL_GORJETA_ALTA = 0.22     # 22% de US$ 0.60 até US$ 1.50
 LIMIAR_GORJETA_ALTA_USD = 0.60
+
 PERCENTUAL_FUNDO_INFRA = 0.30      # 30% -> Infraestrutura, Melhorias, Projetos e Taxas
 PERCENTUAL_LUCRO_LIVRE = 0.70      # 70% -> Administração / Lucro Livre
 RESERVA_MINIMA_ETH_USD = 10.0      # Reserva de giro de US$ 10 em ETH na carteira do iPad
@@ -41,7 +46,6 @@ LIMITE_COFRES = 500
 # Google Sheets / Google Drive (opcional, ativado quando variáveis estão preenchidas)
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-GOOGLE_ABA_NOME = os.getenv("GOOGLE_ABA_NOME", "Historico_Base")
 
 # Configurações do Auto-Refill de Gas (WETH -> ETH na Base)
 WETH_BASE_ADDR = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
@@ -51,8 +55,11 @@ ENDERECO_SIMULADOR = Web3.to_checksum_address("0x0000000000000000000000000000000
 
 FUSO_BRASILIA = timezone(timedelta(hours=-3))
 
+def agora_brasilia():
+    return datetime.now(FUSO_BRASILIA)
+
 def hora_brasilia_str(formato="%H:%M:%S"):
-    return datetime.now(FUSO_BRASILIA).strftime(formato)
+    return agora_brasilia().strftime(formato)
 
 ABI_ESTRATEGIA = [
     {"inputs": [], "name": "callReward", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
@@ -90,12 +97,13 @@ painel_dados = {
 }
 lock_dados = threading.Lock()
 lock_sheets = threading.Lock()
-_planilha_ws = None
+_cliente_sheets = None
+_abas_cache = {}
 
-def obter_planilha_sheets():
-    global _planilha_ws
-    if _planilha_ws is not None:
-        return _planilha_ws
+def obter_cliente_sheets():
+    global _cliente_sheets
+    if _cliente_sheets is not None:
+        return _cliente_sheets
     if not GSHEETS_DISPONIVEL or not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON:
         return None
     try:
@@ -105,32 +113,70 @@ def obter_planilha_sheets():
             "https://www.googleapis.com/auth/drive"
         ]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        cliente = gspread.authorize(creds)
-        planilha = cliente.open_by_key(GOOGLE_SHEET_ID)
-        try:
-            ws = planilha.worksheet(GOOGLE_ABA_NOME)
-        except gspread.WorksheetNotFound:
-            ws = planilha.add_worksheet(title=GOOGLE_ABA_NOME, rows=2000, cols=14)
-        if not ws.row_values(1):
-            ws.append_row([
-                "Data_Hora_BRT", "Modo", "Bloco", "Cofre", "Status",
-                "Lucro_Liquido_USD", "Lucro_Liquido_BRL",
-                "Gas_Gorjeta_USD", "Fundo_30_USD", "Fundo_30_BRL",
-                "Livre_70_USD", "Livre_70_BRL", "Detalhes"
-            ])
-        _planilha_ws = ws
-        return _planilha_ws
+        _cliente_sheets = gspread.authorize(creds)
+        return _cliente_sheets
     except Exception as e:
         print(f"⚠️ Aviso Google Sheets: {e}", flush=True)
         return None
 
-def registrar_vitoria_sheets(linha_dados: list):
-    ws = obter_planilha_sheets()
-    if ws is None:
-        return
-    with lock_sheets:
+def obter_aba_diaria_sheets(data_brt_str: str):
+    """Retorna/cria a aba do dia (ex.: '2026-11-26', janela 00:00:00 a 23:59:59 BRT)."""
+    if data_brt_str in _abas_cache:
+        return _abas_cache[data_brt_str]
+    cliente = obter_cliente_sheets()
+    if cliente is None:
+        return None
+    try:
+        planilha = cliente.open_by_key(GOOGLE_SHEET_ID)
         try:
-            ws.append_row(linha_dados, value_input_option="USER_ENTERED")
+            ws = planilha.worksheet(data_brt_str)
+        except gspread.WorksheetNotFound:
+            ws = planilha.add_worksheet(title=data_brt_str, rows=2000, cols=14)
+
+        if not ws.row_values(1):
+            ws.update("A1:M3", [
+                [
+                    f"FECHAMENTO DIÁRIO ({data_brt_str} • 00:00 às 23:59 BRT)",
+                    "Vitórias", "Líquido Total (US$)", "Líquido Total (R$)",
+                    "70% Livre/Admin (US$)", "70% Livre/Admin (R$)",
+                    "30% Fundo Infra/Taxas (US$)", "30% Fundo Infra/Taxas (R$)",
+                    "Gas + Gorjeta (US$)", "", "", "", ""
+                ],
+                [
+                    "TOTAIS DO DIA",
+                    "=CONT.VALORES(A6:A2000)",
+                    "=SOMA(F6:F2000)",
+                    "=SOMA(G6:G2000)",
+                    "=SOMA(K6:K2000)",
+                    "=SOMA(L6:L2000)",
+                    "=SOMA(I6:I2000)",
+                    "=SOMA(J6:J2000)",
+                    "=SOMA(H6:H2000)",
+                    "", "", "", ""
+                ],
+                ["", "", "", "", "", "", "", "", "", "", "", "", ""]
+            ], value_input_option="USER_ENTERED")
+
+            ws.update("A5:M5", [[
+                "Data_BRT", "Hora_BRT", "Modo", "Bloco", "Cofre",
+                "Lucro_Liquido_USD", "Lucro_Liquido_BRL", "Gas_Gorjeta_USD",
+                "Fundo_30_USD", "Fundo_30_BRL",
+                "Livre_70_USD", "Livre_70_BRL", "Detalhes"
+            ]], value_input_option="USER_ENTERED")
+
+        _abas_cache[data_brt_str] = ws
+        return ws
+    except Exception as e:
+        print(f"⚠️ Aviso ao abrir aba diária ({data_brt_str}): {e}", flush=True)
+        return None
+
+def registrar_vitoria_sheets(data_brt_str: str, linha_dados: list):
+    with lock_sheets:
+        ws = obter_aba_diaria_sheets(data_brt_str)
+        if ws is None:
+            return
+        try:
+            ws.append_row(linha_dados, table_range="A5", value_input_option="USER_ENTERED")
         except Exception as e:
             print(f"⚠️ Falha ao gravar linha no Google Sheets: {e}", flush=True)
 
@@ -212,7 +258,7 @@ HTML_PAINEL = """<!DOCTYPE html>
     <div class="card">
       <div class="card-label">4. Alvos na Faixa Blindada</div>
       <div class="card-val" id="total-tentativas">0</div>
-      <div class="card-sub" id="gas-prioritario">Gas + Gorjeta (15%/22%): US$ 0.00</div>
+      <div class="card-sub" id="gas-prioritario">Gas + Gorjeta (7.5%/15%/22%): US$ 0.00</div>
     </div>
 
     <div class="card">
@@ -224,7 +270,7 @@ HTML_PAINEL = """<!DOCTYPE html>
 
   <div class="table-box">
     <div class="table-head">
-      <span class="table-title">⚔️ Disputa Faixa Blindada (US$ 0.03 – US$ 1.50 | Gorjeta 15% / 22%)</span>
+      <span class="table-title">⚔️ Disputa Faixa Blindada (US$ 0.03 – US$ 1.50 | Gorjeta 7,5% / 15% / 22%)</span>
       <span class="sub">70% Livre/Admin • 30% Infra, Projetos e Taxas</span>
     </div>
     <div style="overflow-x:auto;">
@@ -338,18 +384,25 @@ def carregar_cofres_base():
         pass
     return lista_est[:LIMITE_COFRES]
 
-def obter_percentual_gorjeta(lucro_antes_gorjeta_usd: float) -> tuple[float, int]:
-    """15% até US$ 0.59 e 22% de US$ 0.60 até US$ 1.50."""
+def obter_percentual_gorjeta(lucro_antes_gorjeta_usd: float) -> tuple[float, str]:
+    """
+    Escalonamento de gorjeta em 3 faixas:
+    - US$ 0.03 a US$ 0.10 -> 7,5%
+    - Acima de US$ 0.10 até US$ 0.59 -> 15%
+    - US$ 0.60 até US$ 1.50 -> 22%
+    """
+    if lucro_antes_gorjeta_usd <= LIMIAR_GORJETA_MICRO_USD:
+        return PERCENTUAL_GORJETA_MICRO, "7,5"
     if lucro_antes_gorjeta_usd >= LIMIAR_GORJETA_ALTA_USD:
-        return PERCENTUAL_GORJETA_ALTA, 22
-    return PERCENTUAL_GORJETA_BASE, 15
+        return PERCENTUAL_GORJETA_ALTA, "22"
+    return PERCENTUAL_GORJETA_BASE, "15"
 
 def calcular_gorjeta_dinamica_wei(lucro_bruto_gas_usd, gas_estimado):
     pct_gorjeta, _ = obter_percentual_gorjeta(lucro_bruto_gas_usd)
-    orcamento_tip_usd = max(0.002, lucro_bruto_gas_usd * pct_gorjeta)
+    orcamento_tip_usd = max(0.001, lucro_bruto_gas_usd * pct_gorjeta)
     orcamento_tip_eth = orcamento_tip_usd / PRECO_ETH_USD
     tip_per_gas_wei = int((orcamento_tip_eth * 1e18) / max(1, gas_estimado))
-    min_wei = Web3.to_wei(0.002, 'gwei')
+    min_wei = Web3.to_wei(0.001, 'gwei')
     max_wei = Web3.to_wei(0.08, 'gwei')
     return max(min_wei, min(max_wei, tip_per_gas_wei))
 
@@ -449,7 +502,7 @@ def executar_motor():
     if MODO_REAL and PRIVATE_KEY:
         executor_addr = w3.eth.account.from_key(PRIVATE_KEY).address
 
-    obter_planilha_sheets()
+    obter_aba_diaria_sheets(hora_brasilia_str("%Y-%m-%d"))
 
     with lock_dados:
         painel_dados["conexao_base"] = w3.is_connected()
@@ -535,8 +588,9 @@ def executar_motor():
 
                     status_str = "VITÓRIA" if venceu else "DERROTA"
                     ultima_op_ts = time.time()
-                    hora_brt = hora_brasilia_str("%H:%M:%S")
-                    data_hora_brt = hora_brasilia_str("%Y-%m-%d %H:%M:%S")
+                    dt_brt = agora_brasilia()
+                    data_brt = dt_brt.strftime("%Y-%m-%d")
+                    hora_brt = dt_brt.strftime("%H:%M:%S")
 
                     fundo_30_op = round(lucro_liquido * PERCENTUAL_FUNDO_INFRA, 4) if venceu else 0.0
                     livre_70_op = round(lucro_liquido * PERCENTUAL_LUCRO_LIVRE, 4) if venceu else 0.0
@@ -570,12 +624,12 @@ def executar_motor():
                         painel_dados["operacoes"] = painel_dados["operacoes"][:50]
 
                     if venceu:
-                        registrar_vitoria_sheets([
-                            data_hora_brt,
+                        registrar_vitoria_sheets(data_brt, [
+                            data_brt,
+                            hora_brt,
                             "REAL" if MODO_REAL else "DRY-RUN",
                             bloco,
                             est["nome"],
-                            status_str,
                             round(lucro_liquido, 4),
                             round(lucro_liquido * COTACAO_BRL, 2),
                             round(custo_gas_efetivo, 4),
