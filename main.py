@@ -28,7 +28,7 @@ DESCONTO_SLIPPAGE_REAL = 0.85      # Desconta 15% de perda na troca interna do h
 PERCENTUAL_GORJETA_BASE = 0.15     # 15% até US$ 0.59
 PERCENTUAL_GORJETA_ALTA = 0.22     # 22% de US$ 0.60 até US$ 1.50
 LIMIAR_GORJETA_ALTA_USD = 0.60
-PERCENTUAL_FUNDO_INFRA = 0.30      # 30% -> Infraestrutura, Melhorias e Novos Projetos
+PERCENTUAL_FUNDO_INFRA = 0.30      # 30% -> Infraestrutura, Melhorias, Projetos e Taxas
 PERCENTUAL_LUCRO_LIVRE = 0.70      # 70% -> Administração / Lucro Livre
 RESERVA_MINIMA_ETH_USD = 10.0      # Reserva de giro de US$ 10 em ETH na carteira do iPad
 
@@ -80,7 +80,9 @@ painel_dados = {
     "lucro_acumulado_usd": 0.0,
     "lucro_acumulado_brl": 0.0,
     "fundo_30_usd": 0.0,
+    "fundo_30_brl": 0.0,
     "livre_70_usd": 0.0,
+    "livre_70_brl": 0.0,
     "gas_prioritario_total_usd": 0.0,
     "ultima_atualizacao": "--:--:--",
     "operacoes": [],
@@ -113,8 +115,8 @@ def obter_planilha_sheets():
             ws.append_row([
                 "Data_Hora_BRT", "Modo", "Bloco", "Cofre", "Status",
                 "Lucro_Liquido_USD", "Lucro_Liquido_BRL",
-                "Gas_Gorjeta_USD", "Fundo_30_USD", "Livre_70_USD",
-                "Detalhes"
+                "Gas_Gorjeta_USD", "Fundo_30_USD", "Fundo_30_BRL",
+                "Livre_70_USD", "Livre_70_BRL", "Detalhes"
             ])
         _planilha_ws = ws
         return _planilha_ws
@@ -147,15 +149,18 @@ HTML_PAINEL = """<!DOCTYPE html>
   .dot { width: 8px; height: 8px; background: #3b82f6; border-radius: 50%; animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
   .sub { font-size: 0.85rem; color: #94a3b8; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
   .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 18px; }
-  .card-label { font-size: 0.78rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
-  .card-val { font-size: 1.65rem; font-weight: 700; color: #f8fafc; }
+  .card-label { font-size: 0.76rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+  .card-val { font-size: 1.65rem; font-weight: 700; color: #f8fafc; margin-bottom: 8px; }
   .card-val.green { color: #34d399; }
+  .card-val.amber { color: #fbbf24; }
   .card-val.red { color: #f87171; }
-  .card-sub { font-size: 0.82rem; color: #64748b; margin-top: 4px; }
+  .card-lines { display: flex; flex-direction: column; gap: 4px; font-size: 0.82rem; color: #cbd5e1; }
+  .card-lines span strong { color: #f8fafc; font-weight: 600; }
+  .card-sub { font-size: 0.8rem; color: #64748b; margin-top: 6px; }
   .table-box { background: #111827; border: 1px solid #1f2937; border-radius: 12px; overflow: hidden; }
-  .table-head { padding: 14px 18px; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; align-items: center; }
+  .table-head { padding: 14px 18px; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
   .table-title { font-weight: 600; font-size: 0.95rem; }
   table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
   th { text-align: left; padding: 12px 16px; background: #0f172a; color: #94a3b8; font-weight: 600; font-size: 0.78rem; text-transform: uppercase; }
@@ -181,22 +186,37 @@ HTML_PAINEL = """<!DOCTYPE html>
 
   <div class="grid">
     <div class="card">
-      <div class="card-label">Corridas Vencidas (Até $1.50)</div>
+      <div class="card-label">1. Corridas Vencidas (Até $1.50)</div>
       <div class="card-val green" id="vitorias">0</div>
-      <div class="card-sub" id="lucro-acumulado">Lucro Líquido: US$ 0.00 (R$ 0.00)</div>
+      <div class="card-lines">
+        <span id="linha-liquido">Líquido: <strong>US$ 0.00</strong> • <strong>R$ 0.00</strong></span>
+        <span id="linha-livre-70">70% Livre/Admin: <strong>US$ 0.00</strong> • <strong>R$ 0.00</strong></span>
+      </div>
     </div>
+
     <div class="card">
-      <div class="card-label">Concorrente / Revertido</div>
+      <div class="card-label">2. Fundo 30% (Infra, Projetos e Taxas)</div>
+      <div class="card-val amber" id="fundo-30-destaque">US$ 0.00</div>
+      <div class="card-lines">
+        <span id="linha-fundo-30-brl">Em Reais: <strong>R$ 0.00</strong></span>
+        <span class="card-sub" style="margin-top:0;">Reserva p/ estrutura, nós e taxas</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">3. Concorrente / Revertido</div>
       <div class="card-val red" id="derrotas">0</div>
       <div class="card-sub">Prêmios > $1.50 ignorados</div>
     </div>
+
     <div class="card">
-      <div class="card-label">Alvos na Faixa Blindada</div>
+      <div class="card-label">4. Alvos na Faixa Blindada</div>
       <div class="card-val" id="total-tentativas">0</div>
       <div class="card-sub" id="gas-prioritario">Gas + Gorjeta (15%/22%): US$ 0.00</div>
     </div>
+
     <div class="card">
-      <div class="card-label">Velocidade de Varredura</div>
+      <div class="card-label">5. Velocidade de Varredura</div>
       <div class="card-val" id="ciclo-tempo">0.0s</div>
       <div class="card-sub" id="bloco-num">Bloco Base: #0</div>
     </div>
@@ -205,7 +225,7 @@ HTML_PAINEL = """<!DOCTYPE html>
   <div class="table-box">
     <div class="table-head">
       <span class="table-title">⚔️ Disputa Faixa Blindada (US$ 0.03 – US$ 1.50 | Gorjeta 15% / 22%)</span>
-      <span class="sub">30% Infra/Projetos • 70% Livre</span>
+      <span class="sub">70% Livre/Admin • 30% Infra, Projetos e Taxas</span>
     </div>
     <div style="overflow-x:auto;">
       <table>
@@ -239,10 +259,15 @@ async function atualizarPainel() {
     document.getElementById('derrotas').textContent = d.derrotas;
     document.getElementById('total-tentativas').textContent = d.total_tentativas;
 
-    document.getElementById('lucro-acumulado').textContent =
-      'Líquido: US$ ' + d.lucro_acumulado_usd.toFixed(2) +
-      ' (30%: US$ ' + d.fundo_30_usd.toFixed(2) +
-      ' | 70%: US$ ' + d.livre_70_usd.toFixed(2) + ')';
+    document.getElementById('linha-liquido').innerHTML =
+      'Líquido: <strong>US$ ' + d.lucro_acumulado_usd.toFixed(2) + '</strong> • <strong>R$ ' + d.lucro_acumulado_brl.toFixed(2) + '</strong>';
+    document.getElementById('linha-livre-70').innerHTML =
+      '70% Livre/Admin: <strong>US$ ' + d.livre_70_usd.toFixed(2) + '</strong> • <strong>R$ ' + d.livre_70_brl.toFixed(2) + '</strong>';
+
+    document.getElementById('fundo-30-destaque').textContent = 'US$ ' + d.fundo_30_usd.toFixed(2);
+    document.getElementById('linha-fundo-30-brl').innerHTML =
+      'Em Reais: <strong>R$ ' + d.fundo_30_brl.toFixed(2) + '</strong>';
+
     document.getElementById('gas-prioritario').textContent = 'Gas + Gorjeta: US$ ' + d.gas_prioritario_total_usd.toFixed(2);
     document.getElementById('bloco-num').textContent = 'Bloco Base: #' + d.bloco_atual;
     document.getElementById('ciclo-tempo').textContent = d.tempo_ultimo_ciclo.toFixed(1) + 's';
@@ -513,8 +538,8 @@ def executar_motor():
                     hora_brt = hora_brasilia_str("%H:%M:%S")
                     data_hora_brt = hora_brasilia_str("%Y-%m-%d %H:%M:%S")
 
-                    fundo_30 = round(lucro_liquido * PERCENTUAL_FUNDO_INFRA, 4) if venceu else 0.0
-                    livre_70 = round(lucro_liquido * PERCENTUAL_LUCRO_LIVRE, 4) if venceu else 0.0
+                    fundo_30_op = round(lucro_liquido * PERCENTUAL_FUNDO_INFRA, 4) if venceu else 0.0
+                    livre_70_op = round(lucro_liquido * PERCENTUAL_LUCRO_LIVRE, 4) if venceu else 0.0
 
                     with lock_dados:
                         painel_dados["cofres_auditados_estado"][endereco] = last_harvest_atual
@@ -526,7 +551,9 @@ def executar_motor():
                             painel_dados["lucro_acumulado_usd"] += lucro_liquido
                             painel_dados["lucro_acumulado_brl"] = painel_dados["lucro_acumulado_usd"] * COTACAO_BRL
                             painel_dados["fundo_30_usd"] = painel_dados["lucro_acumulado_usd"] * PERCENTUAL_FUNDO_INFRA
+                            painel_dados["fundo_30_brl"] = painel_dados["fundo_30_usd"] * COTACAO_BRL
                             painel_dados["livre_70_usd"] = painel_dados["lucro_acumulado_usd"] * PERCENTUAL_LUCRO_LIVRE
+                            painel_dados["livre_70_brl"] = painel_dados["livre_70_usd"] * COTACAO_BRL
                         else:
                             painel_dados["derrotas"] += 1
 
@@ -552,8 +579,10 @@ def executar_motor():
                             round(lucro_liquido, 4),
                             round(lucro_liquido * COTACAO_BRL, 2),
                             round(custo_gas_efetivo, 4),
-                            fundo_30,
-                            livre_70,
+                            fundo_30_op,
+                            round(fundo_30_op * COTACAO_BRL, 2),
+                            livre_70_op,
+                            round(livre_70_op * COTACAO_BRL, 2),
                             mensagem
                         ])
 
