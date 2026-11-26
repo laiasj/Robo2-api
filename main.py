@@ -39,6 +39,7 @@ RESERVA_MINIMA_ETH_USD = 10.0      # Reserva de giro de US$ 10 em ETH na carteir
 
 INTERVALO_ENTRE_OPS_SEG = 10.0     # Evita rajadas consecutivas
 BLOCOS_ESPERA_CONFIRMACAO = 2      # Na Base (2s/bloco), 2 blocos = ~4s para confirmação
+TEMPO_MAXIMO_CICLO_SEG = 18.0      # Evita que o ciclo fique preso se o RPC oscilar
 RPC_BASE = os.getenv("RPC_BASE", "https://mainnet.base.org")
 PRECO_ETH_USD = float(os.getenv("PRECO_ETH_USD", "3200.00"))
 LIMITE_COFRES = 500
@@ -282,7 +283,7 @@ HTML_PAINEL = """<!DOCTYPE html>
             <th>Cofre / Estratégia</th>
             <th>Resultado</th>
             <th>Lucro Líquido</th>
-            <th>Cronômetro & Gorjeta</th>
+            <th>Cronômetro, Taxa Rede & Gorjeta</th>
           </tr>
         </thead>
         <tbody id="tabela-ops">
@@ -467,7 +468,7 @@ def executar_harvest_real(w3, contrato, gas_estimado, base_fee_wei, priority_fee
     recibo = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
     return recibo.status == 1, tx_hash.hex()
 
-def simular_corrida_boca_cofre(w3, contrato, executor_addr, bloco_chegada, last_harvest_antes, gorjeta_usd, pct_label):
+def simular_corrida_boca_cofre(w3, contrato, executor_addr, bloco_chegada, last_harvest_antes, taxa_rede_usd, gorjeta_usd, pct_label):
     t0 = time.time()
     try:
         contrato.functions.harvest().call({"from": executor_addr})
@@ -490,12 +491,15 @@ def simular_corrida_boca_cofre(w3, contrato, executor_addr, bloco_chegada, last_
         reward_depois = contrato.functions.callReward().call()
         if last_harvest_depois > last_harvest_antes or reward_depois == 0:
             return False, f"Concorrente levou antes do Bloco #{bloco_alvo}"
-        return True, f"{latencia_ms}ms • Gorjeta {pct_label}% US$ {gorjeta_usd:.3f} • Livre até #{bloco_alvo}"
+        return True, (
+            f"{latencia_ms}ms • Taxa Rede US$ {taxa_rede_usd:.3f} • "
+            f"Gorjeta {pct_label}% US$ {gorjeta_usd:.3f} • Livre até #{bloco_alvo}"
+        )
     except Exception:
         return False, "Oscilação de leitura no fechamento do bloco"
 
 def executar_motor():
-    w3 = Web3(Web3.HTTPProvider(RPC_BASE, request_kwargs={"timeout": 8}))
+    w3 = Web3(Web3.HTTPProvider(RPC_BASE, request_kwargs={"timeout": 6}))
     estrategias_base = carregar_cofres_base()
 
     executor_addr = ENDERECO_SIMULADOR
@@ -538,9 +542,26 @@ def executar_motor():
         with lock_dados:
             painel_dados["ciclo_atual"] = ciclo
             painel_dados["bloco_atual"] = bloco
+            painel_dados["ultima_atualizacao"] = hora_brasilia_str("%H:%M:%S")
             painel_dados["status"] = f"Varrendo faixa blindada no Bloco #{bloco}..."
 
-        for est in estrategias_base:
+        for idx, est in enumerate(estrategias_base):
+            # Evita que o ciclo fique preso se o RPC oscilar
+            if time.time() - inicio_ciclo >= TEMPO_MAXIMO_CICLO_SEG:
+                break
+
+            # Atualiza bloco vivo no painel a cada 25 cofres
+            if idx > 0 and idx % 25 == 0:
+                try:
+                    bloco = w3.eth.block_number
+                    gas_price_wei = w3.eth.gas_price
+                    with lock_dados:
+                        painel_dados["bloco_atual"] = bloco
+                        painel_dados["ultima_atualizacao"] = hora_brasilia_str("%H:%M:%S")
+                        painel_dados["status"] = f"Varrendo cofre {idx}/{len(estrategias_base)} • Bloco #{bloco}..."
+                except Exception:
+                    pass
+
             if time.time() - ultima_op_ts < INTERVALO_ENTRE_OPS_SEG:
                 continue
 
@@ -580,10 +601,18 @@ def executar_motor():
                 if lucro_liquido >= MARGEM_MINIMA_LUCRO_USD:
                     if MODO_REAL and PRIVATE_KEY:
                         venceu, tx_hash = executar_harvest_real(w3, contrato, gas_estimado, gas_price_wei, priority_fee_wei)
-                        mensagem = f"TX confirmada: {tx_hash[:12]}... (Tip {pct_label}%: US$ {gorjeta_usd:.3f})" if venceu else f"TX revertida: {tx_hash[:12]}..."
+                        mensagem = (
+                            f"TX {tx_hash[:10]}... • Taxa Rede US$ {custo_gas_base_usd:.3f} • "
+                            f"Gorjeta {pct_label}% US$ {gorjeta_usd:.3f}"
+                        ) if venceu else (
+                            f"TX revertida: {tx_hash[:10]}... • Taxa Rede US$ {custo_gas_base_usd:.3f}"
+                        )
                         custo_gas_efetivo = custo_gas_total_usd if venceu else (custo_gas_total_usd * 0.20)
                     else:
-                        venceu, mensagem = simular_corrida_boca_cofre(w3, contrato, executor_addr, bloco, last_harvest_atual, gorjeta_usd, pct_label)
+                        venceu, mensagem = simular_corrida_boca_cofre(
+                            w3, contrato, executor_addr, bloco, last_harvest_atual,
+                            custo_gas_base_usd, gorjeta_usd, pct_label
+                        )
                         custo_gas_efetivo = custo_gas_total_usd if venceu else (custo_gas_total_usd * 0.20)
 
                     status_str = "VITÓRIA" if venceu else "DERROTA"
@@ -649,7 +678,7 @@ def executar_motor():
             painel_dados["tempo_ultimo_ciclo"] = duracao
             painel_dados["ultima_atualizacao"] = hora_brasilia_str("%H:%M:%S")
             painel_dados["status"] = f"Faixa blindada ativa ($0.03-$1.50) • Ciclo em {duracao:.1f}s"
-        time.sleep(2)
+        time.sleep(1.5)
 
 if __name__ == "__main__":
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
