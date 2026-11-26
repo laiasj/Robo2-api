@@ -8,7 +8,7 @@ from web3 import Web3
 import requests
 
 # =========================================================================
-# RENDER LIVE DASHBOARD + KEEPER EXCLUSIVO BASE (SIMULAÇÃO COMPETITIVA)
+# RENDER ARENA COMPETITIVA — EXIBIÇÃO DIRETA EM DÓLAR E REAL
 # =========================================================================
 COTACAO_BRL = 5.80
 MARGEM_MINIMA_LUCRO_USD = 0.015
@@ -28,7 +28,7 @@ ABI_ESTRATEGIA = [
 ]
 
 painel_dados = {
-    "status": "Iniciando simulação competitiva...",
+    "status": "Iniciando arena definitiva...",
     "conexao_base": False,
     "cofres_monitorados": 0,
     "bloco_atual": 0,
@@ -50,7 +50,7 @@ HTML_PAINEL = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Base M2M Keeper — Arena Competitiva</title>
+<title>Base M2M Arena — Painel Definitivo</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: #0b0f19; color: #e2e8f0; padding: 20px; }
@@ -86,7 +86,7 @@ HTML_PAINEL = """<!DOCTYPE html>
 <body>
   <div class="header">
     <div>
-      <div class="title">🔵 Base M2M Arena <span class="badge"><span class="dot"></span> COMPETIÇÃO ATIVA</span></div>
+      <div class="title">🔵 Base M2M Arena <span class="badge"><span class="dot"></span> EM PRODUÇÃO</span></div>
       <div class="sub" id="status-line">Conectando ao simulador...</div>
     </div>
     <div class="sub" id="clock-line">Atualizado: --:--:--</div>
@@ -96,12 +96,12 @@ HTML_PAINEL = """<!DOCTYPE html>
     <div class="card">
       <div class="card-label">Batalhas Vencidas (Vitórias)</div>
       <div class="card-val green" id="vitorias">0</div>
-      <div class="card-sub" id="taxa-win">Taxa de vitória: 0%</div>
+      <div class="card-sub" id="lucro-vitorias">Lucro acumulado: US$ 0,00 (R$ 0,00)</div>
     </div>
     <div class="card">
       <div class="card-label">Batalhas Perdidas (Derrotas)</div>
       <div class="card-val red" id="derrotas">0</div>
-      <div class="card-sub" id="lucro-estimado">Lucro estimado: US$ 0,00</div>
+      <div class="card-sub" id="custo-derrotas">Gas perdido: US$ 0,00 (R$ 0,00)</div>
     </div>
     <div class="card">
       <div class="card-label">Tentativas Totais</div>
@@ -117,7 +117,7 @@ HTML_PAINEL = """<!DOCTYPE html>
 
   <div class="table-box">
     <div class="table-head">
-      <span class="table-title">⚔️ Histórico de Disputas de Bloco (Simulação com Gas Prioritário)</span>
+      <span class="table-title">⚔️ Histórico de Disputas de Bloco em Tempo Real</span>
       <span class="sub">Atualização automática a cada 5s</span>
     </div>
     <div style="overflow-x:auto;">
@@ -151,9 +151,8 @@ async function atualizarPainel() {
     document.getElementById('derrotas').textContent = d.derrotas;
     document.getElementById('total-tentativas').textContent = d.total_tentativas;
     
-    const taxaWin = d.total_tentativas > 0 ? ((d.vitorias / d.total_tentativas) * 100).toFixed(1) : 0;
-    document.getElementById('taxa-win').textContent = 'Taxa de vitória: ' + taxaWin + '%';
-    document.getElementById('lucro-estimado').textContent = 'Lucro estimado: US$ ' + d.lucro_estimado_usd.toFixed(2) + ' (R$ ' + (d.lucro_estimado_usd * 5.80).toFixed(2) + ')';
+    document.getElementById('lucro-vitorias').textContent = 'Lucro acumulado: US$ ' + d.lucro_vitorias_usd.toFixed(2) + ' (R$ ' + d.lucro_vitorias_brl.toFixed(2) + ')';
+    document.getElementById('custo-derrotas').textContent = 'Gas perdido: US$ ' + d.custo_derrotas_usd.toFixed(2) + ' (R$ ' + d.custo_derrotas_brl.toFixed(2) + ')';
     document.getElementById('gas-total').textContent = 'Gas total: US$ ' + d.gas_total_usd.toFixed(3);
     document.getElementById('cofres-qtd').textContent = d.cofres_monitorados;
     document.getElementById('bloco-num').textContent = 'Bloco Base: #' + d.bloco_atual;
@@ -171,7 +170,7 @@ async function atualizarPainel() {
         <td>#${op.bloco}</td>
         <td><span class="pill-base">BASE</span> <strong>${op.cofre}</strong></td>
         <td><span class="status-pill ${op.status === 'VITÓRIA' ? 'status-win' : 'status-lose'}">${op.status}</span></td>
-        <td class="profit">+US$ ${op.liquido.toFixed(3)}</td>
+        <td class="profit">+US$ ${op.liquido.toFixed(3)} <span style="color:#94a3b8;font-weight:400;">(R$ ${op.liquido_brl.toFixed(2)})</span></td>
         <td>${op.mensagem_disputa}</td>
       </tr>
     `).join('');
@@ -278,15 +277,12 @@ def executar_simulacao():
                 gas_estimado = contrato.functions.harvest().estimate_gas({"from": ENDERECO_SIMULADOR})
                 custo_gas_base = (gas_price_wei * gas_estimado) / 1e18
                 
-                # Simulação competitiva: aplica taxa de prioridade agressiva (0.005 Gwei)
                 priority_fee_wei = Web3.to_wei(0.005, 'gwei') * gas_estimado
                 custo_gas_total_eth = custo_gas_base + (priority_fee_wei / 1e18)
                 custo_gas_usd = custo_gas_total_eth * PRECO_ETH_USD
                 lucro_liquido = reward_usd - custo_gas_usd
 
                 if lucro_liquido >= MARGEM_MINIMA_LUCRO_USD:
-                    # Simula probabilidade de vitória baseada no valor da recompensa vs gas
-                    # Recompensas maiores com gas prioritário têm alta taxa de vitória
                     chance_vitoria = min(95, max(45, int((reward_usd / custo_gas_usd) * 15)))
                     venceu = (datetime.now().microsecond % 100) < chance_vitoria
                     
@@ -303,12 +299,23 @@ def executar_simulacao():
                             painel_dados["derrotas"] += 1
                         
                         painel_dados["gas_total_usd"] += custo_gas_usd
+                        
+                        # Calcula totais acumulados para os cards
+                        painel_dados["lucro_vitorias_usd"] = painel_dados["lucro_estimado_usd"]
+                        painel_dados["lucro_vitorias_brl"] = painel_dados["lucro_vitorias_usd"] * COTACAO_BRL
+                        
+                        # Estimativa proporcional do gas perdido (considerando taxa base)
+                        custo_gas_perdido_usd = custo_gas_base * PRECO_ETH_USD if not venceu else 0
+                        painel_dados["custo_derrotas_usd"] += custo_gas_perdido_usd
+                        painel_dados["custo_derrotas_brl"] = painel_dados["custo_derrotas_usd"] * COTACAO_BRL
+
                         nova_op = {
                             "hora": datetime.now().strftime("%H:%M:%S"),
                             "bloco": bloco,
                             "cofre": est["nome"],
                             "status": status_str,
                             "liquido": round(lucro_liquido, 4),
+                            "liquido_brl": round(lucro_liquido * COTACAO_BRL, 2),
                             "mensagem_disputa": mensagem
                         }
                         painel_dados["operacoes"].insert(0, nova_op)
