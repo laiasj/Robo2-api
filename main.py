@@ -10,6 +10,9 @@ import requests
 # =========================================================================
 # RENDER ARENA COMPETITIVA — HISTÓRICO EM TEMPO REAL E CONTROLE DE GAS
 # =========================================================================
+MODO_REAL = os.getenv("MODO_REAL", "false").lower() == "true"
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+
 COTACAO_BRL = 5.80
 MARGEM_MINIMA_LUCRO_USD = 0.015
 TETO_SANIDADE_REWARD_USD = 8.00
@@ -30,6 +33,7 @@ ABI_ESTRATEGIA = [
 painel_dados = {
     "status": "Iniciando arena em tempo real...",
     "conexao_base": False,
+    "modo_operacao": "REAL (ON-CHAIN)" if MODO_REAL else "SIMULAÇÃO",
     "cofres_monitorados": 0,
     "bloco_atual": 0,
     "ciclo_atual": 0,
@@ -87,7 +91,7 @@ HTML_PAINEL = """<!DOCTYPE html>
 <body>
   <div class="header">
     <div>
-      <div class="title">🔵 Base M2M Arena <span class="badge"><span class="dot"></span> TEMPO REAL</span></div>
+      <div class="title">🔵 Base M2M Arena <span class="badge"><span class="dot"></span> <span id="modo-badge">TEMPO REAL</span></span></div>
       <div class="sub" id="status-line">Conectando ao motor...</div>
     </div>
     <div class="sub" id="clock-line">Atualizado: --:--:--</div>
@@ -146,6 +150,7 @@ async function atualizarPainel() {
     const resp = await fetch('/api/status');
     const d = await resp.json();
 
+    document.getElementById('modo-badge').textContent = d.modo_operacao;
     document.getElementById('status-line').textContent = d.status;
     document.getElementById('clock-line').textContent = 'Última leitura: ' + d.ultima_atualizacao;
     document.getElementById('vitorias').textContent = d.vitorias;
@@ -223,9 +228,31 @@ def carregar_cofres_base():
         pass
     return lista_est[:LIMITE_COFRES]
 
+def executar_harvest_real(w3, contrato, gas_estimado, base_fee_wei):
+    conta = w3.eth.account.from_key(PRIVATE_KEY)
+    priority_fee = Web3.to_wei(0.005, 'gwei')
+    max_fee = (base_fee_wei * 2) + priority_fee
+
+    tx = contrato.functions.harvest().build_transaction({
+        "from": conta.address,
+        "nonce": w3.eth.get_transaction_count(conta.address),
+        "gas": int(gas_estimado * 1.15),
+        "maxFeePerGas": max_fee,
+        "maxPriorityFeePerGas": priority_fee,
+        "chainId": 8453
+    })
+    assinada = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(assinada.raw_transaction)
+    recibo = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+    return recibo.status == 1, tx_hash.hex()
+
 def executar_motor():
     w3 = Web3(Web3.HTTPProvider(RPC_BASE, request_kwargs={"timeout": 8}))
     estrategias_base = carregar_cofres_base()
+
+    executor_addr = ENDERECO_SIMULADOR
+    if MODO_REAL and PRIVATE_KEY:
+        executor_addr = w3.eth.account.from_key(PRIVATE_KEY).address
 
     with lock_dados:
         painel_dados["conexao_base"] = w3.is_connected()
@@ -272,10 +299,9 @@ def executar_motor():
                 reward_usd = (reward_wei / 1e18) * PRECO_ETH_USD
                 if reward_usd > TETO_SANIDADE_REWARD_USD: continue
 
-                gas_estimado = contrato.functions.harvest().estimate_gas({"from": ENDERECO_SIMULADOR})
+                gas_estimado = contrato.functions.harvest().estimate_gas({"from": executor_addr})
                 custo_gas_base_eth = (gas_price_wei * gas_estimado) / 1e18
                 
-                # Custo rigoroso do Gas Prioritário (Taxa base + Prioridade)
                 priority_fee_wei = Web3.to_wei(0.005, 'gwei') * gas_estimado
                 custo_gas_total_eth = custo_gas_base_eth + (priority_fee_wei / 1e18)
                 custo_gas_prioritario_usd = custo_gas_total_eth * PRECO_ETH_USD
@@ -283,11 +309,15 @@ def executar_motor():
                 lucro_liquido = reward_usd - custo_gas_prioritario_usd
 
                 if lucro_liquido >= MARGEM_MINIMA_LUCRO_USD:
-                    chance_vitoria = min(95, max(45, int((reward_usd / custo_gas_prioritario_usd) * 15)))
-                    venceu = (datetime.now().microsecond % 100) < chance_vitoria
+                    if MODO_REAL and PRIVATE_KEY:
+                        venceu, tx_hash = executar_harvest_real(w3, contrato, gas_estimado, gas_price_wei)
+                        mensagem = f"TX confirmada: {tx_hash[:12]}..." if venceu else f"TX revertida: {tx_hash[:12]}..."
+                    else:
+                        chance_vitoria = min(95, max(45, int((reward_usd / custo_gas_prioritario_usd) * 15)))
+                        venceu = (datetime.now().microsecond % 100) < chance_vitoria
+                        mensagem = "Simulação: inclusão priorizada no bloco" if venceu else "Simulação: disputa perdida no sequenciador"
                     
                     status_str = "VITÓRIA" if venceu else "DERROTA"
-                    mensagem = f"Transação priorizada incluída no bloco" if venceu else f"Disputa perdida no sequenciador"
 
                     with lock_dados:
                         painel_dados["historico_ts"][endereco] = agora_ts
@@ -322,7 +352,7 @@ def executar_motor():
             painel_dados["tempo_ultimo_ciclo"] = duracao
             painel_dados["ultima_atualizacao"] = datetime.now().strftime("%H:%M:%S")
             painel_dados["status"] = f"Monitorando arena ativa • Último ciclo em {duracao:.1f}s"
-        time.sleep(8)
+        time.sleep(3)
 
 if __name__ == "__main__":
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
