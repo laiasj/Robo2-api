@@ -8,25 +8,24 @@ from web3 import Web3
 import requests
 
 # =========================================================================
-# BASE M2M ARENA — AUDITORIA REAL DE CONCORRÊNCIA (SHADOW MODE + REAL)
+# BASE M2M ARENA — CORRIDA REAL NA BOCA DO COFRE (DRY-RUN BLOQUEADO)
 # =========================================================================
 MODO_REAL = os.getenv("MODO_REAL", "false").lower() == "true"
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 
 COTACAO_BRL = 5.80
 MARGEM_MINIMA_LUCRO_USD = 0.03
+DESCONTO_SLIPPAGE_REAL = 0.85      # Desconta 15% de perda na troca interna do harvest
 TETO_SANIDADE_REWARD_USD = 8.00
-COOLDOWN_SEGUNDOS = 3600
-TEMPO_JANELA_DISPUTA_SEG = 3.0  # Tempo real de latência + confirmação na Base
+INTERVALO_ENTRE_OPS_SEG = 10.0     # Evita rajadas no mesmo segundo
+BLOCOS_ESPERA_CONFIRMACAO = 2      # Na Base (2s/bloco), 2 blocos = ~4s para sua TX entrar
 RPC_BASE = os.getenv("RPC_BASE", "https://mainnet.base.org")
 PRECO_ETH_USD = 3200.00
 LIMITE_COFRES = 500
 
-# Configurações do Auto-Refill de Gas (WETH -> ETH na Base)
 WETH_BASE_ADDR = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
 SALDO_MINIMO_ETH = Web3.to_wei(0.003, 'ether')
 MINIMO_WETH_UNWRAP = Web3.to_wei(0.002, 'ether')
-
 ENDERECO_SIMULADOR = Web3.to_checksum_address("0x000000000000000000000000000000000000dEaD")
 
 ABI_ESTRATEGIA = [
@@ -42,9 +41,9 @@ ABI_WETH = [
 ]
 
 painel_dados = {
-    "status": "Iniciando auditoria real de concorrência...",
+    "status": "Iniciando corrida na boca do cofre...",
     "conexao_base": False,
-    "modo_operacao": "REAL (ON-CHAIN)" if MODO_REAL else "AUDITORIA REAL (SHADOW)",
+    "modo_operacao": "REAL (ON-CHAIN)" if MODO_REAL else "DRY-RUN (BOCA DO COFRE)",
     "cofres_monitorados": 0,
     "bloco_atual": 0,
     "ciclo_atual": 0,
@@ -57,7 +56,7 @@ painel_dados = {
     "gas_prioritario_total_usd": 0.0,
     "ultima_atualizacao": "--:--:--",
     "operacoes": [],
-    "historico_ts": {}
+    "cofres_auditados_estado": {}
 }
 lock_dados = threading.Lock()
 
@@ -66,7 +65,7 @@ HTML_PAINEL = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Base M2M Arena — Auditoria Real</title>
+<title>Base M2M Arena — Corrida na Boca do Cofre</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: #0b0f19; color: #e2e8f0; padding: 20px; }
@@ -102,7 +101,7 @@ HTML_PAINEL = """<!DOCTYPE html>
 <body>
   <div class="header">
     <div>
-      <div class="title">🔵 Base M2M Arena <span class="badge"><span class="dot"></span> <span id="modo-badge">AUDITORIA REAL</span></span></div>
+      <div class="title">🔵 Base M2M Arena <span class="badge"><span class="dot"></span> <span id="modo-badge">DRY-RUN (BOCA DO COFRE)</span></span></div>
       <div class="sub" id="status-line">Conectando ao motor...</div>
     </div>
     <div class="sub" id="clock-line">Atualizado: --:--:--</div>
@@ -110,17 +109,17 @@ HTML_PAINEL = """<!DOCTYPE html>
 
   <div class="grid">
     <div class="card">
-      <div class="card-label">Janelas Reais Vencidas</div>
+      <div class="card-label">Corridas Vencidas (2 Blocos)</div>
       <div class="card-val green" id="vitorias">0</div>
-      <div class="card-sub" id="lucro-acumulado">Lucro Real: US$ 0.00 (R$ 0.00)</div>
+      <div class="card-sub" id="lucro-acumulado">Lucro Líquido: US$ 0.00 (R$ 0.00)</div>
     </div>
     <div class="card">
-      <div class="card-label">Perdidas p/ Concorrentes</div>
+      <div class="card-label">Concorrente Passou na Frente</div>
       <div class="card-val red" id="derrotas">0</div>
-      <div class="card-sub">Outras carteiras colheram antes</div>
+      <div class="card-sub">Colhido antes de 2 blocos ou revertido</div>
     </div>
     <div class="card">
-      <div class="card-label">Oportunidades Auditadas</div>
+      <div class="card-label">Chegadas na Boca do Cofre</div>
       <div class="card-val" id="total-tentativas">0</div>
       <div class="card-sub" id="gas-prioritario">Gas estimado: US$ 0.00</div>
     </div>
@@ -133,23 +132,23 @@ HTML_PAINEL = """<!DOCTYPE html>
 
   <div class="table-box">
     <div class="table-head">
-      <span class="table-title">⚔️ Registro Real da Concorrência On-Chain</span>
-      <span class="sub">Verificação bloco a bloco sem sorteio</span>
+      <span class="table-title">⚔️ Disputa Real Bloco a Bloco (Chegada sem Execução)</span>
+      <span class="sub">Valida eth_call e aguarda fechamento de 2 blocos reais</span>
     </div>
     <div style="overflow-x:auto;">
       <table>
         <thead>
           <tr>
             <th>Hora</th>
-            <th>Bloco</th>
+            <th>Bloco Chegada</th>
             <th>Cofre / Estratégia</th>
-            <th>Resultado Real</th>
+            <th>Resultado</th>
             <th>Lucro Líquido</th>
-            <th>Diagnóstico On-Chain</th>
+            <th>Cronômetro da Disputa</th>
           </tr>
         </thead>
         <tbody id="tabela-ops">
-          <tr><td colspan="6" class="empty">Auditando blocos reais na rede Base...</td></tr>
+          <tr><td colspan="6" class="empty">Disputando blocos reais na rede Base...</td></tr>
         </tbody>
       </table>
     </div>
@@ -168,7 +167,7 @@ async function atualizarPainel() {
     document.getElementById('derrotas').textContent = d.derrotas;
     document.getElementById('total-tentativas').textContent = d.total_tentativas;
     
-    document.getElementById('lucro-acumulado').textContent = 'Lucro Real: US$ ' + d.lucro_acumulado_usd.toFixed(2) + ' (R$ ' + d.lucro_acumulado_brl.toFixed(2) + ')';
+    document.getElementById('lucro-acumulado').textContent = 'Lucro Líquido: US$ ' + d.lucro_acumulado_usd.toFixed(2) + ' (R$ ' + d.lucro_acumulado_brl.toFixed(2) + ')';
     document.getElementById('gas-prioritario').textContent = 'Gas estimado: US$ ' + d.gas_prioritario_total_usd.toFixed(2);
     document.getElementById('bloco-num').textContent = 'Bloco Base: #' + d.bloco_atual;
     document.getElementById('ciclo-tempo').textContent = d.tempo_ultimo_ciclo.toFixed(1) + 's';
@@ -207,7 +206,7 @@ class ArenaHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             with lock_dados:
-                payload = {k: v for k, v in painel_dados.items() if k != "historico_ts"}
+                payload = {k: v for k, v in painel_dados.items() if k != "cofres_auditados_estado"}
             self.wfile.write(json.dumps(payload).encode("utf-8"))
         else:
             self.send_response(200)
@@ -288,18 +287,35 @@ def executar_harvest_real(w3, contrato, gas_estimado, base_fee_wei):
     recibo = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
     return recibo.status == 1, tx_hash.hex()
 
-def auditar_janela_real(contrato, last_harvest_antes):
-    # Aguarda o tempo real de envio + confirmação no bloco seguinte da Base (~3s)
-    time.sleep(TEMPO_JANELA_DISPUTA_SEG)
+def simular_corrida_boca_cofre(w3, contrato, executor_addr, bloco_chegada, last_harvest_antes):
+    # 1. Chega na boca do cofre e valida execução real via eth_call (sem assinar/enviar)
+    t0 = time.time()
+    try:
+        contrato.functions.harvest().call({"from": executor_addr})
+    except Exception:
+        return False, "Chegou na boca, mas contrato reverteria (sem liquidez)"
+    latencia_ms = int((time.time() - t0) * 1000)
+
+    # 2. Aguarda o fechamento real de 2 blocos na rede Base (~4 segundos)
+    bloco_alvo = bloco_chegada + BLOCOS_ESPERA_CONFIRMACAO
+    while True:
+        try:
+            bloco_agora = w3.eth.block_number
+            if bloco_agora >= bloco_alvo:
+                break
+        except Exception:
+            pass
+        time.sleep(0.6)
+
+    # 3. Confere quem levou nos blocos seguintes
     try:
         last_harvest_depois = contrato.functions.lastHarvest().call()
         reward_depois = contrato.functions.callReward().call()
-        # Se lastHarvest mudou ou a recompensa zerou, outro robô real levou antes!
         if last_harvest_depois > last_harvest_antes or reward_depois == 0:
-            return False, "Concorrente real colheu o cofre na janela de 3s"
-        return True, "Janela aberta por +3s — execução real teria vencido"
+            return False, f"Concorrente real levou antes do Bloco #{bloco_alvo}"
+        return True, f"Chegou em {latencia_ms}ms • Livre até Bloco #{bloco_alvo} (teria vencido)"
     except Exception:
-        return False, "Oscilação de leitura durante confirmação do bloco"
+        return False, "Oscilação de leitura no fechamento do bloco"
 
 def executar_motor():
     w3 = Web3(Web3.HTTPProvider(RPC_BASE, request_kwargs={"timeout": 8}))
@@ -312,9 +328,11 @@ def executar_motor():
     with lock_dados:
         painel_dados["conexao_base"] = w3.is_connected()
         painel_dados["cofres_monitorados"] = len(estrategias_base)
-        painel_dados["status"] = "Auditor ativo. Medindo concorrência real..."
+        painel_dados["status"] = "Motor na boca do cofre ativo..."
 
     ciclo = 0
+    ultima_op_ts = 0.0
+
     while True:
         ciclo += 1
         inicio_ciclo = time.time()
@@ -339,25 +357,29 @@ def executar_motor():
         with lock_dados:
             painel_dados["ciclo_atual"] = ciclo
             painel_dados["bloco_atual"] = bloco
-            painel_dados["status"] = f"Auditando disputas reais no Bloco #{bloco}..."
+            painel_dados["status"] = f"Disputando blocos reais no Bloco #{bloco}..."
 
         for est in estrategias_base:
-            endereco = est["endereco"]
-            if agora_ts - painel_dados["historico_ts"].get(endereco, 0) < COOLDOWN_SEGUNDOS:
+            if time.time() - ultima_op_ts < INTERVALO_ENTRE_OPS_SEG:
                 continue
+
+            endereco = est["endereco"]
 
             try:
                 contrato = w3.eth.contract(address=endereco, abi=ABI_ESTRATEGIA)
                 if contrato.functions.paused().call(): continue
                 
                 last_harvest_atual = contrato.functions.lastHarvest().call()
+                if painel_dados["cofres_auditados_estado"].get(endereco) == last_harvest_atual:
+                    continue
+
                 if agora_ts - last_harvest_atual < 600: continue
 
                 reward_wei = contrato.functions.callReward().call()
                 if reward_wei <= 0: continue
 
-                reward_usd = (reward_wei / 1e18) * PRECO_ETH_USD
-                if reward_usd > TETO_SANIDADE_REWARD_USD: continue
+                reward_usd_real = ((reward_wei / 1e18) * PRECO_ETH_USD) * DESCONTO_SLIPPAGE_REAL
+                if reward_usd_real > TETO_SANIDADE_REWARD_USD: continue
 
                 gas_estimado = contrato.functions.harvest().estimate_gas({"from": executor_addr})
                 custo_gas_base_eth = (gas_price_wei * gas_estimado) / 1e18
@@ -366,21 +388,22 @@ def executar_motor():
                 custo_gas_total_eth = custo_gas_base_eth + (priority_fee_wei / 1e18)
                 custo_gas_prioritario_usd = custo_gas_total_eth * PRECO_ETH_USD
                 
-                lucro_liquido = reward_usd - custo_gas_prioritario_usd
+                lucro_liquido = reward_usd_real - custo_gas_prioritario_usd
 
                 if lucro_liquido >= MARGEM_MINIMA_LUCRO_USD:
                     if MODO_REAL and PRIVATE_KEY:
                         venceu, tx_hash = executar_harvest_real(w3, contrato, gas_estimado, gas_price_wei)
-                        mensagem = f"TX confirmada: {tx_hash[:12]}..." if venceu else f"TX revertida por concorrente: {tx_hash[:12]}..."
+                        mensagem = f"TX confirmada: {tx_hash[:12]}..." if venceu else f"TX revertida: {tx_hash[:12]}..."
                         custo_gas_efetivo = custo_gas_prioritario_usd if venceu else (custo_gas_prioritario_usd * 0.25)
                     else:
-                        venceu, mensagem = auditar_janela_real(contrato, last_harvest_atual)
+                        venceu, mensagem = simular_corrida_boca_cofre(w3, contrato, executor_addr, bloco, last_harvest_atual)
                         custo_gas_efetivo = custo_gas_prioritario_usd if venceu else (custo_gas_prioritario_usd * 0.25)
                     
                     status_str = "VITÓRIA" if venceu else "DERROTA"
+                    ultima_op_ts = time.time()
 
                     with lock_dados:
-                        painel_dados["historico_ts"][endereco] = agora_ts
+                        painel_dados["cofres_auditados_estado"][endereco] = last_harvest_atual
                         painel_dados["total_tentativas"] += 1
                         painel_dados["gas_prioritario_total_usd"] += custo_gas_efetivo
                         
@@ -411,7 +434,7 @@ def executar_motor():
         with lock_dados:
             painel_dados["tempo_ultimo_ciclo"] = duracao
             painel_dados["ultima_atualizacao"] = datetime.now().strftime("%H:%M:%S")
-            painel_dados["status"] = f"Auditoria real ativa • Último ciclo em {duracao:.1f}s"
+            painel_dados["status"] = f"Dry-Run boca do cofre • Último ciclo em {duracao:.1f}s"
         time.sleep(2)
 
 if __name__ == "__main__":
