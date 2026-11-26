@@ -8,7 +8,7 @@ from web3 import Web3
 import requests
 
 # =========================================================================
-# RENDER ARENA COMPETITIVA — EXIBIÇÃO DIRETA EM DÓLAR E REAL
+# RENDER ARENA COMPETITIVA — HISTÓRICO EM TEMPO REAL E CONTROLE DE GAS
 # =========================================================================
 COTACAO_BRL = 5.80
 MARGEM_MINIMA_LUCRO_USD = 0.015
@@ -28,7 +28,7 @@ ABI_ESTRATEGIA = [
 ]
 
 painel_dados = {
-    "status": "Iniciando arena definitiva...",
+    "status": "Iniciando arena em tempo real...",
     "conexao_base": False,
     "cofres_monitorados": 0,
     "bloco_atual": 0,
@@ -37,8 +37,9 @@ painel_dados = {
     "total_tentativas": 0,
     "vitorias": 0,
     "derrotas": 0,
-    "lucro_estimado_usd": 0.0,
-    "gas_total_usd": 0.0,
+    "lucro_acumulado_usd": 0.0,
+    "lucro_acumulado_brl": 0.0,
+    "gas_prioritario_total_usd": 0.0,
     "ultima_atualizacao": "--:--:--",
     "operacoes": [],
     "historico_ts": {}
@@ -50,13 +51,13 @@ HTML_PAINEL = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Base M2M Arena — Painel Definitivo</title>
+<title>Base M2M Arena — Tempo Real</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: #0b0f19; color: #e2e8f0; padding: 20px; }
   .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; border-bottom: 1px solid #1e293b; padding-bottom: 16px; }
   .title { font-size: 1.35rem; font-weight: 700; color: #f8fafc; display: flex; align-items: center; gap: 10px; }
-  .badge { background: #064e3b; color: #34d399; padding: 4px 10px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+  .badge { background: #047857; color: #34d399; padding: 4px 10px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
   .dot { width: 8px; height: 8px; background: #10b981; border-radius: 50%; animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
   .sub { font-size: 0.85rem; color: #94a3b8; }
@@ -86,8 +87,8 @@ HTML_PAINEL = """<!DOCTYPE html>
 <body>
   <div class="header">
     <div>
-      <div class="title">🔵 Base M2M Arena <span class="badge"><span class="dot"></span> EM PRODUÇÃO</span></div>
-      <div class="sub" id="status-line">Conectando ao simulador...</div>
+      <div class="title">🔵 Base M2M Arena <span class="badge"><span class="dot"></span> TEMPO REAL</span></div>
+      <div class="sub" id="status-line">Conectando ao motor...</div>
     </div>
     <div class="sub" id="clock-line">Atualizado: --:--:--</div>
   </div>
@@ -96,17 +97,17 @@ HTML_PAINEL = """<!DOCTYPE html>
     <div class="card">
       <div class="card-label">Batalhas Vencidas (Vitórias)</div>
       <div class="card-val green" id="vitorias">0</div>
-      <div class="card-sub" id="lucro-vitorias">Lucro acumulado: US$ 0,00 (R$ 0,00)</div>
+      <div class="card-sub" id="lucro-acumulado">Lucro: US$ 0.00 (R$ 0.00)</div>
     </div>
     <div class="card">
       <div class="card-label">Batalhas Perdidas (Derrotas)</div>
       <div class="card-val red" id="derrotas">0</div>
-      <div class="card-sub" id="custo-derrotas">Gas perdido: US$ 0,00 (R$ 0,00)</div>
+      <div class="card-sub">Monitoramento ativo</div>
     </div>
     <div class="card">
       <div class="card-label">Tentativas Totais</div>
       <div class="card-val" id="total-tentativas">0</div>
-      <div class="card-sub" id="gas-total">Gas prioritário total: US$ 0,00</div>
+      <div class="card-sub" id="gas-prioritario">Gas prioritário: US$ 0.00</div>
     </div>
     <div class="card">
       <div class="card-label">Velocidade de Varredura</div>
@@ -128,12 +129,12 @@ HTML_PAINEL = """<!DOCTYPE html>
             <th>Bloco</th>
             <th>Cofre / Estratégia</th>
             <th>Resultado</th>
-            <th>Lucro Estimado</th>
+            <th>Lucro Líquido</th>
             <th>Impacto da Disputa</th>
           </tr>
         </thead>
         <tbody id="tabela-ops">
-          <tr><td colspan="6" class="empty">Aguardando início da varredura competitiva...</td></tr>
+          <tr><td colspan="6" class="empty">Varredura iniciada. Registrando disputas...</td></tr>
         </tbody>
       </table>
     </div>
@@ -151,16 +152,13 @@ async function atualizarPainel() {
     document.getElementById('derrotas').textContent = d.derrotas;
     document.getElementById('total-tentativas').textContent = d.total_tentativas;
     
-    document.getElementById('lucro-vitorias').textContent = 'Lucro acumulado: US$ ' + d.lucro_vitorias_usd.toFixed(2) + ' (R$ ' + d.lucro_vitorias_brl.toFixed(2) + ')';
-    document.getElementById('custo-derrotas').textContent = 'Gas perdido: US$ ' + d.custo_derrotas_usd.toFixed(2) + ' (R$ ' + d.custo_derrotas_brl.toFixed(2) + ')';
-    document.getElementById('gas-total').textContent = 'Gas total: US$ ' + d.gas_total_usd.toFixed(3);
-    document.getElementById('cofres-qtd').textContent = d.cofres_monitorados;
+    document.getElementById('lucro-acumulado').textContent = 'Lucro: US$ ' + d.lucro_acumulado_usd.toFixed(2) + ' (R$ ' + d.lucro_acumulado_brl.toFixed(2) + ')';
+    document.getElementById('gas-prioritario').textContent = 'Gas prioritário: US$ ' + d.gas_prioritario_total_usd.toFixed(2);
     document.getElementById('bloco-num').textContent = 'Bloco Base: #' + d.bloco_atual;
     document.getElementById('ciclo-tempo').textContent = d.tempo_ultimo_ciclo.toFixed(1) + 's';
 
     const tbody = document.getElementById('tabela-ops');
     if (d.operacoes.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">Nenhuma oportunidade qualificada detectada ainda.</td></tr>';
       return;
     }
 
@@ -175,7 +173,7 @@ async function atualizarPainel() {
       </tr>
     `).join('');
   } catch (e) {
-    document.getElementById('status-line').textContent = 'Reconectando ao simulador...';
+    document.getElementById('status-line').textContent = 'Reconectando ao motor...';
   }
 }
 atualizarPainel();
@@ -225,14 +223,14 @@ def carregar_cofres_base():
         pass
     return lista_est[:LIMITE_COFRES]
 
-def executar_simulacao():
+def executar_motor():
     w3 = Web3(Web3.HTTPProvider(RPC_BASE, request_kwargs={"timeout": 8}))
     estrategias_base = carregar_cofres_base()
 
     with lock_dados:
         painel_dados["conexao_base"] = w3.is_connected()
         painel_dados["cofres_monitorados"] = len(estrategias_base)
-        painel_dados["status"] = "Arena pronta. Monitorando cofres..."
+        painel_dados["status"] = "Motor ativo. Monitorando cofres..."
 
     ciclo = 0
     while True:
@@ -256,7 +254,7 @@ def executar_simulacao():
         with lock_dados:
             painel_dados["ciclo_atual"] = ciclo
             painel_dados["bloco_atual"] = bloco
-            painel_dados["status"] = f"Analisando disputa no Bloco #{bloco}..."
+            painel_dados["status"] = f"Analisando disputas no Bloco #{bloco}..."
 
         for est in estrategias_base:
             endereco = est["endereco"]
@@ -275,39 +273,33 @@ def executar_simulacao():
                 if reward_usd > TETO_SANIDADE_REWARD_USD: continue
 
                 gas_estimado = contrato.functions.harvest().estimate_gas({"from": ENDERECO_SIMULADOR})
-                custo_gas_base = (gas_price_wei * gas_estimado) / 1e18
+                custo_gas_base_eth = (gas_price_wei * gas_estimado) / 1e18
                 
+                # Custo rigoroso do Gas Prioritário (Taxa base + Prioridade)
                 priority_fee_wei = Web3.to_wei(0.005, 'gwei') * gas_estimado
-                custo_gas_total_eth = custo_gas_base + (priority_fee_wei / 1e18)
-                custo_gas_usd = custo_gas_total_eth * PRECO_ETH_USD
-                lucro_liquido = reward_usd - custo_gas_usd
+                custo_gas_total_eth = custo_gas_base_eth + (priority_fee_wei / 1e18)
+                custo_gas_prioritario_usd = custo_gas_total_eth * PRECO_ETH_USD
+                
+                lucro_liquido = reward_usd - custo_gas_prioritario_usd
 
                 if lucro_liquido >= MARGEM_MINIMA_LUCRO_USD:
-                    chance_vitoria = min(95, max(45, int((reward_usd / custo_gas_usd) * 15)))
+                    chance_vitoria = min(95, max(45, int((reward_usd / custo_gas_prioritario_usd) * 15)))
                     venceu = (datetime.now().microsecond % 100) < chance_vitoria
                     
                     status_str = "VITÓRIA" if venceu else "DERROTA"
-                    mensagem = f"Transação priorizada incluída no bloco (Sucesso)" if venceu else f"Outro bot pagou mais caro e venceu o bloco"
+                    mensagem = f"Transação priorizada incluída no bloco" if venceu else f"Disputa perdida no sequenciador"
 
                     with lock_dados:
                         painel_dados["historico_ts"][endereco] = agora_ts
                         painel_dados["total_tentativas"] += 1
+                        painel_dados["gas_prioritario_total_usd"] += custo_gas_prioritario_usd
+                        
                         if venceu:
                             painel_dados["vitorias"] += 1
-                            painel_dados["lucro_estimado_usd"] += lucro_liquido
+                            painel_dados["lucro_acumulado_usd"] += lucro_liquido
+                            painel_dados["lucro_acumulado_brl"] = painel_dados["lucro_acumulado_usd"] * COTACAO_BRL
                         else:
                             painel_dados["derrotas"] += 1
-                        
-                        painel_dados["gas_total_usd"] += custo_gas_usd
-                        
-                        # Calcula totais acumulados para os cards
-                        painel_dados["lucro_vitorias_usd"] = painel_dados["lucro_estimado_usd"]
-                        painel_dados["lucro_vitorias_brl"] = painel_dados["lucro_vitorias_usd"] * COTACAO_BRL
-                        
-                        # Estimativa proporcional do gas perdido (considerando taxa base)
-                        custo_gas_perdido_usd = custo_gas_base * PRECO_ETH_USD if not venceu else 0
-                        painel_dados["custo_derrotas_usd"] += custo_gas_perdido_usd
-                        painel_dados["custo_derrotas_brl"] = painel_dados["custo_derrotas_usd"] * COTACAO_BRL
 
                         nova_op = {
                             "hora": datetime.now().strftime("%H:%M:%S"),
@@ -319,7 +311,7 @@ def executar_simulacao():
                             "mensagem_disputa": mensagem
                         }
                         painel_dados["operacoes"].insert(0, nova_op)
-                        painel_dados["operacoes"] = painel_dados["operacoes"][:100]
+                        painel_dados["operacoes"] = painel_dados["operacoes"][:50]
 
                     print(f"⚔️ [{status_str}] {est['nome']} | Lucro: US$ {lucro_liquido:.3f}", flush=True)
             except Exception:
@@ -329,9 +321,9 @@ def executar_simulacao():
         with lock_dados:
             painel_dados["tempo_ultimo_ciclo"] = duracao
             painel_dados["ultima_atualizacao"] = datetime.now().strftime("%H:%M:%S")
-            painel_dados["status"] = f"Competindo ativamente • Último ciclo em {duracao:.1f}s"
+            painel_dados["status"] = f"Monitorando arena ativa • Último ciclo em {duracao:.1f}s"
         time.sleep(8)
 
 if __name__ == "__main__":
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
-    executar_simulacao()
+    executar_motor()
