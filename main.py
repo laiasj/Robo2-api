@@ -2,7 +2,7 @@ import os
 import time
 import json
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from web3 import Web3
 import requests
@@ -18,13 +18,16 @@ except Exception:
 # =========================================================================
 # BASE M2M ARENA — FAIXA BLINDADA (US$ 0.03 A US$ 1.50) + ANTI-MEV
 # =========================================================================
-MODO_REAL = os.getenv("MODO_REAL", "false").lower() == "true"
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+CHAIN_ID = 8453
+NOME_REDE = "Base"
 
-COTACAO_BRL = 5.80
-MARGEM_MINIMA_LUCRO_USD = 0.03
-TETO_ATAQUE_LUCRO_USD = 1.50       # Ignora prêmios > US$ 1.50 para evitar guerra MEV e revert
-DESCONTO_SLIPPAGE_REAL = 0.85      # Desconta 15% de perda na troca interna do harvest
+MODO_REAL = os.getenv("MODO_REAL", "false").lower() == "true"
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+
+COTACAO_BRL = float(os.getenv("COTACAO_BRL", "5.80"))
+MARGEM_MINIMA_LUCRO_USD = float(os.getenv("MARGEM_MINIMA_LUCRO_USD", "0.03"))
+TETO_ATAQUE_LUCRO_USD = float(os.getenv("TETO_ATAQUE_LUCRO_USD", "1.50"))  # Ignora prêmios > US$ 1.50
+DESCONTO_SLIPPAGE_REAL = float(os.getenv("DESCONTO_SLIPPAGE_REAL", "0.85"))  # Desconta 15% na troca interna
 
 # Escalonamento da gorjeta dinâmica em 3 degraus
 PERCENTUAL_GORJETA_MICRO = 0.075   # 7,5% de US$ 0.03 até US$ 0.10
@@ -35,14 +38,25 @@ LIMIAR_GORJETA_ALTA_USD = 0.60
 
 PERCENTUAL_FUNDO_INFRA = 0.30      # 30% -> Infraestrutura, Melhorias, Projetos e Taxas
 PERCENTUAL_LUCRO_LIVRE = 0.70      # 70% -> Administração / Lucro Livre
-RESERVA_MINIMA_ETH_USD = 10.0      # Reserva de giro de US$ 10 em ETH na carteira do iPad
+RESERVA_MINIMA_ETH_USD = float(os.getenv("RESERVA_MINIMA_ETH_USD", "20.0"))  # Reserva de giro em ETH
 
-INTERVALO_ENTRE_OPS_SEG = 10.0     # Evita rajadas consecutivas
-BLOCOS_ESPERA_CONFIRMACAO = 2      # Na Base (2s/bloco), 2 blocos = ~4s para confirmação
-TEMPO_MAXIMO_CICLO_SEG = 18.0      # Evita que o ciclo fique preso se o RPC oscilar
-RPC_BASE = os.getenv("RPC_BASE", "https://mainnet.base.org")
+INTERVALO_ENTRE_OPS_SEG = float(os.getenv("INTERVALO_ENTRE_OPS_SEG", "10.0"))
+BLOCOS_ESPERA_CONFIRMACAO = 2      # Na Base (~2s/bloco no simulador), 2 blocos para confirmação
+TEMPO_MAXIMO_CICLO_SEG = float(os.getenv("TEMPO_MAXIMO_CICLO_SEG", "18.0"))
+RPC_BASE = os.getenv("RPC_BASE", "https://mainnet.base.org").strip()
+
+# Preço dinâmico do ETH (com fallback para PRECO_ETH_USD)
+PRICE_SOURCE = os.getenv("PRICE_SOURCE", "coinbase").lower()
 PRECO_ETH_USD = float(os.getenv("PRECO_ETH_USD", "3200.00"))
-LIMITE_COFRES = 500
+INTERVALO_PRECO_SEG = int(os.getenv("INTERVALO_PRECO_SEG", "60"))
+
+LIMITE_COFRES = int(os.getenv("LIMITE_COFRES", "500"))
+TIMEOUT_TX_SEG = int(os.getenv("TIMEOUT_TX_SEG", "45"))
+BASE_FEE_MULTIPLIER = float(os.getenv("BASE_FEE_MULTIPLIER", "2.0"))
+
+# Proteção de segurança contra reverts em sequência ou perda diária excessiva (sem limite de qtd de ops/dia)
+MAX_PERDA_DIARIA_USD = float(os.getenv("MAX_PERDA_DIARIA_USD", "5.00"))
+MAX_REVERTS_CONSECUTIVOS = int(os.getenv("MAX_REVERTS_CONSECUTIVOS", "4"))
 
 # Google Sheets / Google Drive (opcional, ativado quando variáveis estão preenchidas)
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -50,17 +64,21 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 
 # Configurações do Auto-Refill de Gas (WETH -> ETH na Base)
 WETH_BASE_ADDR = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
-SALDO_MINIMO_ETH = Web3.to_wei(0.003, 'ether')
-MINIMO_WETH_UNWRAP = Web3.to_wei(0.002, 'ether')
+SALDO_MINIMO_ETH = Web3.to_wei(float(os.getenv("SALDO_MINIMO_ETH", "0.003")), "ether")
+MINIMO_WETH_UNWRAP = Web3.to_wei(float(os.getenv("MINIMO_WETH_UNWRAP", "0.002")), "ether")
+MAX_WETH_UNWRAP = Web3.to_wei(float(os.getenv("MAX_WETH_UNWRAP", "0.01")), "ether")
 ENDERECO_SIMULADOR = Web3.to_checksum_address("0x000000000000000000000000000000000000dEaD")
 
 FUSO_BRASILIA = timezone(timedelta(hours=-3))
 
+
 def agora_brasilia():
     return datetime.now(FUSO_BRASILIA)
 
+
 def hora_brasilia_str(formato="%H:%M:%S"):
     return agora_brasilia().strftime(formato)
+
 
 ABI_ESTRATEGIA = [
     {"inputs": [], "name": "callReward", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
@@ -92,14 +110,90 @@ painel_dados = {
     "livre_70_usd": 0.0,
     "livre_70_brl": 0.0,
     "gas_prioritario_total_usd": 0.0,
+    "preco_eth_usd": PRECO_ETH_USD,
+    "perda_dia_usd": 0.0,
+    "operacoes_dia": 0,
+    "reverts_consecutivos": 0,
+    "circuit_breaker": False,
     "ultima_atualizacao": "--:--:--",
     "operacoes": [],
     "cofres_auditados_estado": {}
 }
+
 lock_dados = threading.Lock()
 lock_sheets = threading.Lock()
+lock_nonce = threading.Lock()
+
 _cliente_sheets = None
 _abas_cache = {}
+_dia_ativo_brt = hora_brasilia_str("%Y-%m-%d")
+_preco_eth_cache = {"valor": PRECO_ETH_USD, "timestamp": 0.0}
+
+
+def atualizar_preco_eth_usd():
+    global _preco_eth_cache
+    agora = time.time()
+    if agora - _preco_eth_cache["timestamp"] < INTERVALO_PRECO_SEG and _preco_eth_cache["valor"] > 0:
+        return _preco_eth_cache["valor"]
+
+    if PRICE_SOURCE == "coinbase":
+        try:
+            resp = requests.get("https://api.coinbase.com/v2/prices/ETH-USD/spot", timeout=5)
+            resp.raise_for_status()
+            valor = float(resp.json()["data"]["amount"])
+            if valor > 0:
+                _preco_eth_cache["valor"] = valor
+                _preco_eth_cache["timestamp"] = agora
+                with lock_dados:
+                    painel_dados["preco_eth_usd"] = valor
+                return valor
+        except Exception:
+            pass
+
+    return _preco_eth_cache["valor"]
+
+
+def verificar_virada_dia_brt(data_atual_str: str):
+    global _dia_ativo_brt
+    if data_atual_str != _dia_ativo_brt:
+        _dia_ativo_brt = data_atual_str
+        with lock_dados:
+            painel_dados["operacoes_dia"] = 0
+            painel_dados["perda_dia_usd"] = 0.0
+            painel_dados["reverts_consecutivos"] = 0
+            painel_dados["circuit_breaker"] = False
+
+
+def circuito_bloqueado():
+    with lock_dados:
+        return bool(painel_dados["circuit_breaker"])
+
+
+def registrar_revert_cb():
+    with lock_dados:
+        painel_dados["reverts_consecutivos"] += 1
+        if painel_dados["reverts_consecutivos"] >= MAX_REVERTS_CONSECUTIVOS:
+            painel_dados["circuit_breaker"] = True
+            painel_dados["status"] = "CIRCUIT BREAKER: reverts consecutivos atingiram o limite."
+
+
+def resetar_reverts_cb():
+    with lock_dados:
+        painel_dados["reverts_consecutivos"] = 0
+
+
+def registrar_perda_cb(valor_usd: float):
+    with lock_dados:
+        painel_dados["perda_dia_usd"] += max(0.0, valor_usd)
+        if painel_dados["perda_dia_usd"] >= MAX_PERDA_DIARIA_USD:
+            painel_dados["circuit_breaker"] = True
+            painel_dados["status"] = "CIRCUIT BREAKER: limite de perda diária atingido."
+
+
+def registrar_operacao_cb():
+    with lock_dados:
+        painel_dados["operacoes_dia"] += 1
+
 
 def obter_cliente_sheets():
     global _cliente_sheets
@@ -120,8 +214,9 @@ def obter_cliente_sheets():
         print(f"⚠️ Aviso Google Sheets: {e}", flush=True)
         return None
 
+
 def obter_aba_diaria_sheets(data_brt_str: str):
-    """Retorna/cria a aba do dia (ex.: '2026-11-26', janela 00:00:00 a 23:59:59 BRT)."""
+    """Retorna/cria a aba do dia (ex.: '2026-11-27', janela 00:00:00 a 23:59:59 BRT)."""
     if data_brt_str in _abas_cache:
         return _abas_cache[data_brt_str]
     cliente = obter_cliente_sheets()
@@ -171,6 +266,7 @@ def obter_aba_diaria_sheets(data_brt_str: str):
         print(f"⚠️ Aviso ao abrir aba diária ({data_brt_str}): {e}", flush=True)
         return None
 
+
 def registrar_vitoria_sheets(data_brt_str: str, linha_dados: list):
     with lock_sheets:
         ws = obter_aba_diaria_sheets(data_brt_str)
@@ -180,6 +276,7 @@ def registrar_vitoria_sheets(data_brt_str: str, linha_dados: list):
             ws.append_row(linha_dados, table_range="A5", value_input_option="USER_ENTERED")
         except Exception as e:
             print(f"⚠️ Falha ao gravar linha no Google Sheets: {e}", flush=True)
+
 
 HTML_PAINEL = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -266,6 +363,7 @@ HTML_PAINEL = """<!DOCTYPE html>
       <div class="card-label">5. Velocidade de Varredura</div>
       <div class="card-val" id="ciclo-tempo">0.0s</div>
       <div class="card-sub" id="bloco-num">Bloco Base: #0</div>
+      <div class="card-sub" id="eth-line" style="margin-top:2px;">ETH: US$ 0.00</div>
     </div>
   </div>
 
@@ -296,7 +394,7 @@ HTML_PAINEL = """<!DOCTYPE html>
 <script>
 async function atualizarPainel() {
   try {
-    const resp = await fetch('/api/status');
+    const resp = await fetch('/api/status', {cache: 'no-store'});
     const d = await resp.json();
 
     document.getElementById('modo-badge').textContent = d.modo_operacao;
@@ -317,6 +415,7 @@ async function atualizarPainel() {
 
     document.getElementById('gas-prioritario').textContent = 'Gas + Gorjeta: US$ ' + d.gas_prioritario_total_usd.toFixed(2);
     document.getElementById('bloco-num').textContent = 'Bloco Base: #' + d.bloco_atual;
+    document.getElementById('eth-line').textContent = 'ETH: US$ ' + d.preco_eth_usd.toFixed(2);
     document.getElementById('ciclo-tempo').textContent = d.tempo_ultimo_ciclo.toFixed(1) + 's';
 
     const tbody = document.getElementById('tabela-ops');
@@ -345,27 +444,34 @@ setInterval(atualizarPainel, 5000);
 </html>
 """
 
+
 class ArenaHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/status":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             with lock_dados:
                 payload = {k: v for k, v in painel_dados.items() if k != "cofres_auditados_estado"}
-            self.wfile.write(json.dumps(payload).encode("utf-8"))
+            self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(HTML_PAINEL.encode("utf-8"))
-    def log_message(self, format, *args): pass
+
+    def log_message(self, format, *args):
+        pass
+
 
 def iniciar_servidor_web():
     porta = int(os.getenv("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", porta), ArenaHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", porta), ArenaHandler)
     server.serve_forever()
+
 
 def carregar_cofres_base():
     lista_est = []
@@ -385,6 +491,7 @@ def carregar_cofres_base():
         pass
     return lista_est[:LIMITE_COFRES]
 
+
 def obter_percentual_gorjeta(lucro_antes_gorjeta_usd: float) -> tuple[float, str]:
     """
     Escalonamento de gorjeta em 3 faixas:
@@ -398,19 +505,32 @@ def obter_percentual_gorjeta(lucro_antes_gorjeta_usd: float) -> tuple[float, str
         return PERCENTUAL_GORJETA_ALTA, "22"
     return PERCENTUAL_GORJETA_BASE, "15"
 
-def calcular_gorjeta_dinamica_wei(lucro_bruto_gas_usd, gas_estimado):
+
+def calcular_gorjeta_dinamica_wei(lucro_bruto_gas_usd, gas_estimado, preco_eth_usd):
     pct_gorjeta, _ = obter_percentual_gorjeta(lucro_bruto_gas_usd)
     orcamento_tip_usd = max(0.001, lucro_bruto_gas_usd * pct_gorjeta)
-    orcamento_tip_eth = orcamento_tip_usd / PRECO_ETH_USD
+    orcamento_tip_eth = orcamento_tip_usd / max(preco_eth_usd, 1.0)
     tip_per_gas_wei = int((orcamento_tip_eth * 1e18) / max(1, gas_estimado))
-    min_wei = Web3.to_wei(0.001, 'gwei')
-    max_wei = Web3.to_wei(0.08, 'gwei')
+    min_wei = Web3.to_wei(0.001, "gwei")
+    max_wei = Web3.to_wei(0.25, "gwei")
     return max(min_wei, min(max_wei, tip_per_gas_wei))
 
-def verificar_reserva_gas_usd(w3, executor_addr):
+
+def obter_base_fee(w3):
+    try:
+        bloco = w3.eth.get_block("latest")
+        base_fee = bloco.get("baseFeePerGas")
+        if base_fee is not None:
+            return int(base_fee)
+    except Exception:
+        pass
+    return int(w3.eth.gas_price)
+
+
+def verificar_reserva_gas_usd(w3, executor_addr, preco_eth_usd):
     try:
         saldo_eth_wei = w3.eth.get_balance(executor_addr)
-        saldo_eth_usd = float(Web3.from_wei(saldo_eth_wei, 'ether')) * PRECO_ETH_USD
+        saldo_eth_usd = float(Web3.from_wei(saldo_eth_wei, "ether")) * preco_eth_usd
         if saldo_eth_usd < RESERVA_MINIMA_ETH_USD:
             print(
                 f"⛽ Aviso Reserva ETH: saldo atual ~US$ {saldo_eth_usd:.2f} "
@@ -419,6 +539,7 @@ def verificar_reserva_gas_usd(w3, executor_addr):
             )
     except Exception:
         pass
+
 
 def verificar_e_reabastecer_gas(w3):
     if not MODO_REAL or not PRIVATE_KEY:
@@ -434,39 +555,67 @@ def verificar_e_reabastecer_gas(w3):
         if saldo_weth < MINIMO_WETH_UNWRAP:
             return
 
-        base_fee = w3.eth.gas_price
-        priority_fee = Web3.to_wei(0.002, 'gwei')
-        tx = weth_contrato.functions.withdraw(saldo_weth).build_transaction({
-            "from": conta.address,
-            "nonce": w3.eth.get_transaction_count(conta.address),
-            "gas": 50000,
-            "maxFeePerGas": (base_fee * 2) + priority_fee,
-            "maxPriorityFeePerGas": priority_fee,
-            "chainId": 8453
-        })
-        assinada = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(assinada.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=20)
-        print(f"⛽ Auto-Refill concluído: {Web3.from_wei(saldo_weth, 'ether'):.5f} WETH convertidos em ETH!", flush=True)
+        necessario = max(0, SALDO_MINIMO_ETH - saldo_eth)
+        quantidade = min(saldo_weth, MAX_WETH_UNWRAP, necessario)
+        if quantidade < MINIMO_WETH_UNWRAP:
+            return
+
+        base_fee = obter_base_fee(w3)
+        priority_fee = Web3.to_wei(0.002, "gwei")
+
+        with lock_nonce:
+            nonce = w3.eth.get_transaction_count(conta.address, "pending")
+            tx = weth_contrato.functions.withdraw(quantidade).build_transaction({
+                "from": conta.address,
+                "nonce": nonce,
+                "gas": 50000,
+                "maxFeePerGas": int(base_fee * BASE_FEE_MULTIPLIER + priority_fee),
+                "maxPriorityFeePerGas": priority_fee,
+                "chainId": CHAIN_ID
+            })
+            assinada = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(assinada.raw_transaction)
+
+        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=TIMEOUT_TX_SEG)
+        print(f"⛽ Auto-Refill concluído: {Web3.from_wei(quantidade, 'ether'):.5f} WETH convertidos em ETH!", flush=True)
     except Exception as e:
         print(f"⚠️ Falha no Auto-Refill de gas: {e}", flush=True)
 
+
 def executar_harvest_real(w3, contrato, gas_estimado, base_fee_wei, priority_fee_wei):
     conta = w3.eth.account.from_key(PRIVATE_KEY)
-    max_fee = (base_fee_wei * 2) + priority_fee_wei
+    max_fee = int(base_fee_wei * BASE_FEE_MULTIPLIER + priority_fee_wei)
 
-    tx = contrato.functions.harvest().build_transaction({
-        "from": conta.address,
-        "nonce": w3.eth.get_transaction_count(conta.address),
-        "gas": int(gas_estimado * 1.05),
-        "maxFeePerGas": max_fee,
-        "maxPriorityFeePerGas": priority_fee_wei,
-        "chainId": 8453
-    })
-    assinada = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(assinada.raw_transaction)
-    recibo = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
-    return recibo.status == 1, tx_hash.hex()
+    try:
+        contrato.functions.harvest().call({"from": conta.address})
+    except Exception as e:
+        return False, "", 0, 0, f"Simulação final reverteu: {str(e)[:120]}"
+
+    with lock_nonce:
+        try:
+            nonce = w3.eth.get_transaction_count(conta.address, "pending")
+        except Exception:
+            nonce = w3.eth.get_transaction_count(conta.address)
+
+        tx = contrato.functions.harvest().build_transaction({
+            "from": conta.address,
+            "nonce": nonce,
+            "gas": int(gas_estimado * 1.05),
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": priority_fee_wei,
+            "chainId": CHAIN_ID
+        })
+        assinada = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(assinada.raw_transaction)
+
+    try:
+        recibo = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=TIMEOUT_TX_SEG)
+        gas_used = int(getattr(recibo, "gasUsed", 0))
+        effective_gas_price = int(getattr(recibo, "effectiveGasPrice", max_fee))
+        return int(recibo.status) == 1, tx_hash.hex(), gas_used, effective_gas_price, ""
+    except Exception as e:
+        return False, tx_hash.hex(), 0, 0, f"Receipt pendente/timeout: {str(e)[:100]}"
+
 
 def simular_corrida_boca_cofre(w3, contrato, executor_addr, bloco_chegada, last_harvest_antes, taxa_rede_usd, gorjeta_usd, pct_label):
     t0 = time.time()
@@ -498,6 +647,7 @@ def simular_corrida_boca_cofre(w3, contrato, executor_addr, bloco_chegada, last_
     except Exception:
         return False, "Oscilação de leitura no fechamento do bloco"
 
+
 def executar_motor():
     w3 = Web3(Web3.HTTPProvider(RPC_BASE, request_kwargs={"timeout": 6}))
     estrategias_base = carregar_cofres_base()
@@ -520,24 +670,34 @@ def executar_motor():
         ciclo += 1
         inicio_ciclo = time.time()
         agora_ts = int(inicio_ciclo)
+        verificar_virada_dia_brt(hora_brasilia_str("%Y-%m-%d"))
+
+        if circuito_bloqueado():
+            time.sleep(10)
+            continue
+
+        preco_eth_usd = atualizar_preco_eth_usd()
 
         if ciclo % 60 == 0 or not estrategias_base:
             estrategias_base = carregar_cofres_base()
-            with lock_dados: painel_dados["cofres_monitorados"] = len(estrategias_base)
+            with lock_dados:
+                painel_dados["cofres_monitorados"] = len(estrategias_base)
 
         if ciclo % 10 == 0:
             verificar_e_reabastecer_gas(w3)
             if MODO_REAL and PRIVATE_KEY:
-                verificar_reserva_gas_usd(w3, executor_addr)
+                verificar_reserva_gas_usd(w3, executor_addr, preco_eth_usd)
 
         if not w3.is_connected():
-            time.sleep(5); continue
+            time.sleep(5)
+            continue
 
         try:
             bloco = w3.eth.block_number
-            gas_price_wei = w3.eth.gas_price
+            gas_price_wei = obter_base_fee(w3)
         except Exception:
-            time.sleep(5); continue
+            time.sleep(5)
+            continue
 
         with lock_dados:
             painel_dados["ciclo_atual"] = ciclo
@@ -546,15 +706,16 @@ def executar_motor():
             painel_dados["status"] = f"Varrendo faixa blindada no Bloco #{bloco}..."
 
         for idx, est in enumerate(estrategias_base):
-            # Evita que o ciclo fique preso se o RPC oscilar
+            if circuito_bloqueado():
+                break
+
             if time.time() - inicio_ciclo >= TEMPO_MAXIMO_CICLO_SEG:
                 break
 
-            # Atualiza bloco vivo no painel a cada 25 cofres
             if idx > 0 and idx % 25 == 0:
                 try:
                     bloco = w3.eth.block_number
-                    gas_price_wei = w3.eth.gas_price
+                    gas_price_wei = obter_base_fee(w3)
                     with lock_dados:
                         painel_dados["bloco_atual"] = bloco
                         painel_dados["ultima_atualizacao"] = hora_brasilia_str("%H:%M:%S")
@@ -569,45 +730,63 @@ def executar_motor():
 
             try:
                 contrato = w3.eth.contract(address=endereco, abi=ABI_ESTRATEGIA)
-                if contrato.functions.paused().call(): continue
+                if contrato.functions.paused().call():
+                    continue
 
                 last_harvest_atual = contrato.functions.lastHarvest().call()
                 if painel_dados["cofres_auditados_estado"].get(endereco) == last_harvest_atual:
                     continue
 
-                if agora_ts - last_harvest_atual < 600: continue
+                if agora_ts - last_harvest_atual < 600:
+                    continue
 
                 reward_wei = contrato.functions.callReward().call()
-                if reward_wei <= 0: continue
+                if reward_wei <= 0:
+                    continue
 
-                reward_usd_real = ((reward_wei / 1e18) * PRECO_ETH_USD) * DESCONTO_SLIPPAGE_REAL
+                reward_usd_real = ((reward_wei / 1e18) * preco_eth_usd) * DESCONTO_SLIPPAGE_REAL
 
                 if reward_usd_real > (TETO_ATAQUE_LUCRO_USD * 1.15):
                     continue
 
                 gas_estimado = contrato.functions.harvest().estimate_gas({"from": executor_addr})
-                custo_gas_base_usd = ((gas_price_wei * gas_estimado) / 1e18) * PRECO_ETH_USD
+                custo_gas_base_usd = ((gas_price_wei * gas_estimado) / 1e18) * preco_eth_usd
                 lucro_antes_gorjeta = reward_usd_real - custo_gas_base_usd
 
                 if lucro_antes_gorjeta < MARGEM_MINIMA_LUCRO_USD or lucro_antes_gorjeta > TETO_ATAQUE_LUCRO_USD:
                     continue
 
                 _, pct_label = obter_percentual_gorjeta(lucro_antes_gorjeta)
-                priority_fee_wei = calcular_gorjeta_dinamica_wei(lucro_antes_gorjeta, gas_estimado)
-                gorjeta_usd = ((priority_fee_wei * gas_estimado) / 1e18) * PRECO_ETH_USD
+                priority_fee_wei = calcular_gorjeta_dinamica_wei(lucro_antes_gorjeta, gas_estimado, preco_eth_usd)
+                gorjeta_usd = ((priority_fee_wei * gas_estimado) / 1e18) * preco_eth_usd
                 custo_gas_total_usd = custo_gas_base_usd + gorjeta_usd
                 lucro_liquido = reward_usd_real - custo_gas_total_usd
 
                 if lucro_liquido >= MARGEM_MINIMA_LUCRO_USD:
+                    registrar_operacao_cb()
+
                     if MODO_REAL and PRIVATE_KEY:
-                        venceu, tx_hash = executar_harvest_real(w3, contrato, gas_estimado, gas_price_wei, priority_fee_wei)
-                        mensagem = (
-                            f"TX {tx_hash[:10]}... • Taxa Rede US$ {custo_gas_base_usd:.3f} • "
-                            f"Gorjeta {pct_label}% US$ {gorjeta_usd:.3f}"
-                        ) if venceu else (
-                            f"TX revertida: {tx_hash[:10]}... • Taxa Rede US$ {custo_gas_base_usd:.3f}"
+                        venceu, tx_hash, gas_used, eff_price, err_det = executar_harvest_real(
+                            w3, contrato, gas_estimado, gas_price_wei, priority_fee_wei
                         )
-                        custo_gas_efetivo = custo_gas_total_usd if venceu else (custo_gas_total_usd * 0.20)
+                        if venceu and gas_used > 0:
+                            gas_real_total_usd = ((gas_used * eff_price) / 1e18) * preco_eth_usd
+                            lucro_liquido = max(0.0, reward_usd_real - gas_real_total_usd)
+                            custo_gas_efetivo = gas_real_total_usd
+                            mensagem = (
+                                f"TX {tx_hash[:10]}... • Gás Real US$ {gas_real_total_usd:.3f} • "
+                                f"Gorjeta alvo {pct_label}% US$ {gorjeta_usd:.3f}"
+                            )
+                        else:
+                            perda_tx = ((gas_used * eff_price) / 1e18) * preco_eth_usd if gas_used > 0 else 0.0
+                            if perda_tx > 0:
+                                registrar_perda_cb(perda_tx)
+                            registrar_revert_cb()
+                            custo_gas_efetivo = perda_tx
+                            mensagem = (
+                                f"TX revertida {tx_hash[:10]}... • Perda US$ {perda_tx:.3f}"
+                                if tx_hash else (err_det or "Falha antes do envio")
+                            )
                     else:
                         venceu, mensagem = simular_corrida_boca_cofre(
                             w3, contrato, executor_addr, bloco, last_harvest_atual,
@@ -625,7 +804,8 @@ def executar_motor():
                     livre_70_op = round(lucro_liquido * PERCENTUAL_LUCRO_LIVRE, 4) if venceu else 0.0
 
                     with lock_dados:
-                        painel_dados["cofres_auditados_estado"][endereco] = last_harvest_atual
+                        if venceu:
+                            painel_dados["cofres_auditados_estado"][endereco] = last_harvest_atual
                         painel_dados["total_tentativas"] += 1
                         painel_dados["gas_prioritario_total_usd"] += custo_gas_efetivo
 
@@ -653,6 +833,7 @@ def executar_motor():
                         painel_dados["operacoes"] = painel_dados["operacoes"][:50]
 
                     if venceu:
+                        resetar_reverts_cb()
                         registrar_vitoria_sheets(data_brt, [
                             data_brt,
                             hora_brt,
@@ -677,8 +858,10 @@ def executar_motor():
         with lock_dados:
             painel_dados["tempo_ultimo_ciclo"] = duracao
             painel_dados["ultima_atualizacao"] = hora_brasilia_str("%H:%M:%S")
-            painel_dados["status"] = f"Faixa blindada ativa ($0.03-$1.50) • Ciclo em {duracao:.1f}s"
+            if not painel_dados["circuit_breaker"]:
+                painel_dados["status"] = f"Faixa blindada ativa ($0.03-$1.50) • Ciclo em {duracao:.1f}s"
         time.sleep(1.5)
+
 
 if __name__ == "__main__":
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
